@@ -39,23 +39,17 @@ uv run python main.py list-races
 
 ## User Flow
 
-```mermaid
-flowchart TD
-    A[Start] --> B{Does the target race already exist?}
-    B -->|Yes| C[uv run python main.py list-races]
-    B -->|No| D[uv run python main.py init-race --race ...]
-    C --> E[Choose the target races/{slug}/ bundle]
-    D --> E
-    E --> F[Prepare entry.csv, history.csv, and race.yaml]
-    F --> G[uv run python main.py predict --race {slug}]
-    G --> H[Review artifacts under outputs/{race_name}/]
-    H --> I{Has the official result been published?}
-    I -->|Not yet| H
-    I -->|Yes| J[Update result.csv]
-    J --> K[uv run python main.py settle --race {slug}]
-    K --> L[Append to data/training/race_results_master.csv]
-    L --> M[Repeat the same loop for the next race]
-```
+The day-to-day workflow fits into five steps.
+
+| Step | What you do | Main command / files | Outcome |
+| --- | --- | --- | --- |
+| 1 | Choose the target race | Existing race: `uv run python main.py list-races` / New race: `uv run python main.py init-race --race <slug> --race-name "..." --race-date YYYY-MM-DD` | `races/<slug>/` is ready to use |
+| 2 | Prepare the prediction inputs | `races/<slug>/entry.csv`, `races/<slug>/history.csv`, `races/<slug>/race.yaml` | The race bundle is ready for prediction |
+| 3 | Run prediction and review artifacts | `uv run python main.py predict --race <slug>` | Prediction artifacts are written under `outputs/<race_name>/` |
+| 4 | Add the official result after the race | Update `races/<slug>/result.csv` | The bundle is ready for settlement |
+| 5 | Settle the race and update history | `uv run python main.py settle --race <slug>` | `post_race_report.json` is generated, and `data/training/race_results_master.csv` is updated when the full result is available |
+
+If `result.csv` contains only a partial result, `post_race_report.json` is still generated, but the cumulative training history is updated only for a full result. The same loop repeats for the next race.
 
 ## Usage
 
@@ -134,43 +128,7 @@ The workflow keeps `predictions.csv`, `recommended_axis_horse.json`, `feature_im
 
 After `settle`, you can inspect `post_race_report.json` to compare predicted leaders with the actual order of finish. When the full result is present, the run also appends to `data/training/race_results_master.csv` for future races.
 
-## Architecture
-
-```mermaid
-flowchart TD
-    A[data/training/race_results_master.csv<br/>cumulative training history]
-    B[races/{slug}/entry.csv<br/>race card]
-    C[races/{slug}/history.csv<br/>recent form history]
-    D[races/{slug}/race.yaml<br/>race profile]
-    E[races/{slug}/result.csv<br/>race result]
-
-    F[main.py<br/>CLI]
-    G[workflow.py<br/>race-level orchestration]
-    H[data_loader.py<br/>validation and normalization]
-    I[features.py<br/>feature engineering]
-    J[hybrid_model.py<br/>ranker + classifier + regressor]
-    K[simulation.py<br/>Plackett-Luce simulation]
-    L[prediction.py<br/>CV, blending, outputs]
-
-    M[outputs/{race_name}/<br/>prediction artifacts]
-    N[data/training/race_results_master.csv<br/>updated history]
-
-    A --> G
-    B --> F
-    C --> F
-    D --> F
-    E --> F
-    F --> G
-    G --> H
-    H --> I
-    I --> J
-    J --> K
-    K --> L
-    L --> M
-    G --> N
-```
-
-### Model Breakdown
+## Model Breakdown
 
 - `workflow.py` merges `src/keiba_predictor/config.yaml` with each race-local `race.yaml` and controls prediction and settlement
 - `prediction.py` runs time-series CV, feature generation, hybrid model training, and artifact generation

@@ -39,23 +39,17 @@ uv run python main.py list-races
 
 ## ユーザーフロー
 
-```mermaid
-flowchart TD
-    A[開始] --> B{対象レースは既にあるか}
-    B -->|はい| C[uv run python main.py list-races]
-    B -->|いいえ| D[uv run python main.py init-race --race ...]
-    C --> E[対象の races/{slug}/ を選ぶ]
-    D --> E
-    E --> F[entry.csv history.csv race.yaml を準備]
-    F --> G[uv run python main.py predict --race {slug}]
-    G --> H[outputs/{race_name}/ の成果物を確認]
-    H --> I{レース結果が確定したか}
-    I -->|まだ| H
-    I -->|はい| J[result.csv を更新]
-    J --> K[uv run python main.py settle --race {slug}]
-    K --> L[data/training/race_results_master.csv に反映]
-    L --> M[次のレースで同じ流れを繰り返す]
-```
+日常運用は、次の 5 ステップで回せます。
+
+| Step | やること | 主なコマンド / ファイル | 結果 |
+| --- | --- | --- | --- |
+| 1 | 対象レースを決める | 既存レース: `uv run python main.py list-races` / 新規レース: `uv run python main.py init-race --race <slug> --race-name "..." --race-date YYYY-MM-DD` | `races/<slug>/` を使う準備が整う |
+| 2 | 予測用の入力を揃える | `races/<slug>/entry.csv`、`races/<slug>/history.csv`、`races/<slug>/race.yaml` | 予測に必要な入力が揃う |
+| 3 | 予測を実行して成果物を確認する | `uv run python main.py predict --race <slug>` | `outputs/<race_name>/` に予測成果物が出る |
+| 4 | レース後に結果を反映する | `races/<slug>/result.csv` を更新 | 確定処理の準備ができる |
+| 5 | 結果確定と学習履歴の更新を行う | `uv run python main.py settle --race <slug>` | `post_race_report.json` を出力し、フル結果なら `data/training/race_results_master.csv` に追記される |
+
+`result.csv` が部分結果でも `post_race_report.json` は生成されますが、累積学習履歴の更新はフル結果のときだけ行われます。次のレースでも同じ流れを繰り返します。
 
 ## 使い方
 
@@ -134,43 +128,7 @@ uv run python main.py settle --race hanshin-daishoten-2026-03-22
 
 `settle` 後は `post_race_report.json` で予測上位と実着順の差分を確認でき、フル結果なら `data/training/race_results_master.csv` に反映されます。単発予測で終わらず、週次で学習履歴を積み上げる運用に使えます。
 
-## アーキテクチャ
-
-```mermaid
-flowchart TD
-    A[data/training/race_results_master.csv<br/>累積学習履歴]
-    B[races/{slug}/entry.csv<br/>出走表]
-    C[races/{slug}/history.csv<br/>近走履歴]
-    D[races/{slug}/race.yaml<br/>レース条件]
-    E[races/{slug}/result.csv<br/>レース結果]
-
-    F[main.py<br/>CLI]
-    G[workflow.py<br/>レース単位のオーケストレーション]
-    H[data_loader.py<br/>検証・正規化]
-    I[features.py<br/>特徴量生成]
-    J[hybrid_model.py<br/>ランカー + 分類器 + 回帰]
-    K[simulation.py<br/>Plackett-Luce シミュレーション]
-    L[prediction.py<br/>CV・ブレンディング・出力]
-
-    M[outputs/{race_name}/<br/>予測成果物]
-    N[data/training/race_results_master.csv<br/>更新済み学習履歴]
-
-    A --> G
-    B --> F
-    C --> F
-    D --> F
-    E --> F
-    F --> G
-    G --> H
-    H --> I
-    I --> J
-    J --> K
-    K --> L
-    L --> M
-    G --> N
-```
-
-### モデル構成
+## モデル構成
 
 - `workflow.py` が `src/keiba_predictor/config.yaml` と各レースの `race.yaml` を統合し、予測と結果確定を制御します
 - `prediction.py` が時系列 CV、特徴量生成、ハイブリッドモデル学習、出力ファイル生成をまとめて実行します
