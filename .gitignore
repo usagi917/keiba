@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Generated outputs
+outputs/
+
+# Race data (scraped from Sports Navi)
+races/**/*.csv
+data/training/
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+
+# Plans
+plans/

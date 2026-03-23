@@ -1,0 +1,103 @@
+seed: 20260321
+
+target_race_profile: {}
+
+similarity_weights:
+  exact_surface_distance: 5.0
+  near_surface_distance: 3.0
+  near_distance_tolerance: 200
+  wide_surface_distance: 1.5
+  wide_distance_tolerance: 600
+  age_4plus: 1.0
+  open_graded: 1.0
+  same_course: 0.8
+  same_turn: 0.6
+  same_season: 0.4
+
+model:
+  ranker:
+    loss_function: QueryRMSE
+    eval_metric: NDCG:top=3
+    iterations: 500
+    learning_rate: 0.05
+    depth: 6
+    l2_leaf_reg: 8.0
+    random_strength: 0.5
+    min_data_in_leaf: 5
+    bootstrap_type: Bernoulli
+    subsample: 0.8
+    thread_count: -1
+  classifier:
+    loss_function: Logloss
+    eval_metric: Logloss
+    iterations: 400
+    learning_rate: 0.05
+    depth: 6
+    l2_leaf_reg: 8.0
+    random_strength: 0.5
+    min_data_in_leaf: 5
+    bootstrap_type: Bernoulli
+    subsample: 0.8
+    auto_class_weights: Balanced
+    thread_count: -1
+    bases: [logistic, random_forest, extra_trees]
+    logistic:
+      C: 0.7
+      max_iter: 1000
+      solver: lbfgs
+      class_weight: balanced
+    random_forest:
+      n_estimators: 240
+      max_depth: 8
+      min_samples_leaf: 3
+      max_features: sqrt
+      class_weight: balanced
+      n_jobs: -1
+    extra_trees:
+      n_estimators: 320
+      max_depth: 10
+      min_samples_leaf: 2
+      max_features: sqrt
+      class_weight: balanced
+      n_jobs: -1
+  regressor:
+    bases: [ridge, random_forest, extra_trees]
+    ridge:
+      alpha: 1.0
+    random_forest:
+      n_estimators: 240
+      max_depth: 10
+      min_samples_leaf: 3
+      max_features: sqrt
+      n_jobs: -1
+    extra_trees:
+      n_estimators: 320
+      max_depth: 12
+      min_samples_leaf: 2
+      max_features: sqrt
+      n_jobs: -1
+  blending:
+    min_weight: 0.08
+    residual_sigma_scale: 0.35
+
+cv:
+  n_splits: 4
+  min_train_races: 50
+  classifier_inner_splits: 3
+  classifier_inner_min_train_races: 20
+  regression_inner_splits: 3
+  regression_inner_min_train_races: 20
+  stacking_inner_splits: 3
+  stacking_inner_min_train_races: 20
+
+simulation:
+  stages: [100000, 300000, 800000]
+  convergence_threshold: 0.002
+  block_size: 50000
+  calibration_trials: 8000
+  calibration_block_size: 4000
+  temperature_grid: [0.35, 0.5, 0.65, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2]
+
+plot:
+  calibration_bins: 10
+  feature_importance_top_n: 20

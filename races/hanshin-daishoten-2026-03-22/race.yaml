@@ -1,0 +1,15 @@
+race_name: Hanshin Daishoten
+race_date: 2026-03-22
+use_odds: true
+
+target_race_profile:
+  name: Hanshin Daishoten
+  race_date: 2026-03-22
+  surface: turf
+  distance: 3000
+  course: Hanshin
+  turn: right
+  grade: G2
+  class: Open
+  season_label: spring
+  season_months: [3, 4, 5]
