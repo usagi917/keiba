@@ -5,17 +5,35 @@
 ![uv](https://img.shields.io/badge/package%20manager-uv-4B5563)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> A horse racing prediction workflow that outputs top-3 finish probabilities and a recommended axis horse using a time-series ensemble model plus Plackett-Luce simulation.
+> A race-bundle-based horse racing workflow that produces top-3 probabilities, an axis horse candidate, and post-race review artifacts.
 
 ## Overview
 
-This repository manages race-specific inputs under `races/<slug>/`, generates prediction artifacts with `predict`, and settles finished races with `settle` to feed results back into the training history.
+This repository manages one input bundle per race under `races/<slug>/` and runs the weekly workflow through `main.py`.
 
-- `predict`: writes `predictions.csv`, `recommended_axis_horse.json`, CV metrics, feature importance, and simulation diagnostics
-- `settle`: writes `settled_entry.csv` and `post_race_report.json`, and updates `data/training/race_results_master.csv` when the full result is available
-- `init-race`: creates a scaffold for a new race directory
+- `list-races`: list available race bundles
+- `init-race`: scaffold a new race directory
+- `predict`: merge cumulative history with race-local history and generate prediction artifacts
+- `settle`: ingest `result.csv`, write review artifacts, and update cumulative training history
 
-`races/hanshin-daishoten-2026-03-22/` is included as a sample race bundle. Running the workflow generates the corresponding artifacts under `outputs/Hanshin Daishoten/`.
+Bundled sample race directories:
+
+- `races/hanshin-daishoten-2026-03-22/`
+- `races/takamatsunomiya-kinen-2026-03-29/`
+
+`outputs/` also contains previously generated artifact snapshots.
+
+## Current Status
+
+This README reflects what was verified on 2026-03-29.
+
+- `uv run pytest`: 68 passed
+- `uv run python main.py --help`
+- `uv run python main.py list-races`
+- `uv run python main.py init-race ...`
+- `uv run python main.py settle ...`
+
+The `predict` command is implemented, but the bundled sample race data currently fails with the CatBoost ranker error `Groupwise loss/metrics require nontrivial groups`. Treat the existing files under `outputs/` as the reference artifact schema for now.
 
 ## Setup
 
@@ -30,44 +48,23 @@ This repository manages race-specific inputs under `races/<slug>/`, generates pr
 uv sync
 ```
 
-### Smoke Test
+### Development Commands
 
 ```bash
 uv run python main.py --help
 uv run python main.py list-races
+uv run pytest
 ```
 
-## User Flow
+## Quick Start
 
-The day-to-day workflow fits into five steps.
-
-| Step | What you do | Main command / files | Outcome |
-| --- | --- | --- | --- |
-| 1 | Choose the target race | Existing race: `uv run python main.py list-races` / New race: `uv run python main.py init-race --race <slug> --race-name "..." --race-date YYYY-MM-DD` | `races/<slug>/` is ready to use |
-| 2 | Prepare the prediction inputs | `races/<slug>/entry.csv`, `races/<slug>/history.csv`, `races/<slug>/race.yaml` | The race bundle is ready for prediction |
-| 3 | Run prediction and review artifacts | `uv run python main.py predict --race <slug>` | Prediction artifacts are written under `outputs/<race_name>/` |
-| 4 | Add the official result after the race | Update `races/<slug>/result.csv` | The bundle is ready for settlement |
-| 5 | Settle the race and update history | `uv run python main.py settle --race <slug>` | `post_race_report.json` is generated, and `data/training/race_results_master.csv` is updated when the full result is available |
-
-If `result.csv` contains only a partial result, `post_race_report.json` is still generated, but the cumulative training history is updated only for a full result. The same loop repeats for the next race.
-
-## Usage
-
-### 1. Predict an Existing Race
+### 1. List available races
 
 ```bash
-uv run python main.py predict --race hanshin-daishoten-2026-03-22
+uv run python main.py list-races
 ```
 
-Main outputs:
-
-- `outputs/Hanshin Daishoten/predictions.csv`
-- `outputs/Hanshin Daishoten/recommended_axis_horse.json`
-- `outputs/Hanshin Daishoten/evaluation_summary.json`
-- `outputs/Hanshin Daishoten/feature_importance.csv`
-- `outputs/Hanshin Daishoten/simulation_diagnostics.csv`
-
-### 2. Create a New Race Bundle
+### 2. Create a new race bundle
 
 ```bash
 uv run python main.py init-race \
@@ -76,7 +73,7 @@ uv run python main.py init-race \
   --race-date 2026-05-03
 ```
 
-Files created:
+Generated files:
 
 - `races/spring-tenno-sho-2026-05-03/race.yaml`
 - `races/spring-tenno-sho-2026-05-03/entry.csv`
@@ -84,55 +81,103 @@ Files created:
 - `races/spring-tenno-sho-2026-05-03/result.csv`
 - `races/spring-tenno-sho-2026-05-03/README.md`
 
-Populate `entry.csv` and `history.csv` manually, or add a race-local data collection script like the sample `refresh_race_data.py`.
-
-### 3. Settle a Finished Race
+### 3. Prediction command shape
 
 ```bash
-uv run python main.py settle --race hanshin-daishoten-2026-03-22
+uv run python main.py predict --race hanshin-daishoten-2026-03-22
 ```
 
-This updates:
+You can also use the shorthand form.
 
-- `outputs/Hanshin Daishoten/settled_entry.csv`
-- `outputs/Hanshin Daishoten/post_race_report.json`
-- `data/training/race_results_master.csv`
+```bash
+uv run python main.py hanshin-daishoten-2026-03-22
+```
 
 Notes:
 
-- The cumulative training history is updated only when `result.csv` contains the full result
-- A partial Top-K result still generates `post_race_report.json`
+- `predict` builds its training set by combining `data/training/race_results_master.csv` with `races/<slug>/history.csv`
+- It automatically excludes the target `race_id` and records on or after the target race date
+- With the currently bundled sample data, this command fails, so use the existing files under `outputs/` to inspect the expected artifact set
 
-### 4. Common Options
+### 4. Settle a finished race
+
+```bash
+uv run python main.py settle --race takamatsunomiya-kinen-2026-03-29
+```
+
+`settle` can run even when `predictions.csv` is missing.
+
+- It always writes `settled_entry.csv` and `post_race_report.json`
+- It writes `post_race_analysis.csv` only when prediction artifacts exist
+- It updates `data/training/race_results_master.csv` only when `result.csv` contains the full result
+
+### 5. Common options
 
 | Command | Option | Purpose |
 | --- | --- | --- |
-| `predict` / `settle` | `--race` | Select a race slug under `races/` |
+| `predict` / `settle` | `--race` | Select a slug under `races/` |
 | `predict` / `settle` | `--race-dir` | Point directly to a race directory |
 | `predict` / `settle` | `--training-history` | Override the cumulative training CSV |
-| `predict` / `settle` | `--output-root` | Override the output root directory |
-| `predict` | `--config` | Replace the base config file |
+| `predict` / `settle` | `--output-root` | Override the output root |
+| `predict` | `--config` | Override the base config file |
+| `init-race` | `--races-root` | Override the race root directory |
 | `init-race` | `--force` | Overwrite scaffold files |
 
-## Use Cases
+## Race Bundle Layout
 
-### 1. Standardize Weekly Graded Stakes Forecasting
+Each `races/<slug>/` directory can contain the following files.
 
-Each race lives in its own `races/<slug>/` bundle, so you can run the same workflow every week while keeping race-specific conditions in `race.yaml`.
+| File | Required | Purpose |
+| --- | --- | --- |
+| `race.yaml` | Required | Race conditions and config overrides. `target_race_profile.surface`, `distance`, and `course` are required. `use_odds` toggles odds/popularity-derived features |
+| `entry.csv` | Required | Current race entrants |
+| `history.csv` | Required | Extra history rows to include for this race |
+| `result.csv` | Required after the race | Official finishing result |
+| `race_result_meta.json` | Optional | Winning time, lap splits, going, and other supplemental race metadata |
+| `README.md` | Optional | Race-local notes |
+| `refresh_race_data.py` | Optional | Race-local data refresh script |
 
-### 2. Review Why the Model Chose an Axis Horse
+The `result.csv` template columns are:
 
-The workflow keeps `predictions.csv`, `recommended_axis_horse.json`, `feature_importance.csv`, and `calibration_curve.csv` together, which makes it easier to review probabilities, model drivers, and calibration quality in one place.
+```text
+horse_id,horse_name,finish_rank,result_time,result_margin,result_last3f,result_final_odds,result_final_popularity,result_body_weight,result_body_weight_diff
+```
 
-### 3. Turn Post-Race Review into Future Training Data
+## Output Files
 
-After `settle`, you can inspect `post_race_report.json` to compare predicted leaders with the actual order of finish. When the full result is present, the run also appends to `data/training/race_results_master.csv` for future races.
+### Files produced by `predict`
 
-## Model Breakdown
+| File | Description |
+| --- | --- |
+| `predictions.csv` | Full prediction table for all horses |
+| `recommended_axis_horse.json` | Detailed payload for the selected axis horse |
+| `evaluation_summary.json` | CV metrics plus data diagnostics |
+| `cv_fold_metrics.csv` | Fold-level evaluation results |
+| `calibration_curve.csv` | Aggregated top-3 calibration data |
+| `feature_importance.csv` | Ranked feature importance table |
+| `simulation_diagnostics.csv` | Simulation convergence diagnostics |
+| `schema_report.json` | Column normalization and schema-validation report |
+| `effective_config.json` | Final merged config from base config plus `race.yaml` |
+| `run_context.json` | Input and output paths used for the run |
+| `top3_probability_bar.png` | Dashboard-style plot for top candidates |
+| `calibration_plot.png` | Calibration visualization |
+| `feature_importance.png` | Feature importance visualization |
 
-- `workflow.py` merges `src/keiba_predictor/config.yaml` with each race-local `race.yaml` and controls prediction and settlement
-- `prediction.py` runs time-series CV, feature generation, hybrid model training, and artifact generation
-- `hybrid_model.py` combines ranking, classification, and regression models, while `simulation.py` estimates finish distributions with Monte Carlo simulation
+### Files produced by `settle`
+
+| File | Description |
+| --- | --- |
+| `settled_entry.csv` | Race card augmented with finishing result columns |
+| `post_race_report.json` | Summary comparison between predictions and actual result |
+| `post_race_analysis.csv` | Per-horse ranking error analysis. Written only when `predictions.csv` exists |
+
+## Model and Preprocessing
+
+- `data_loader.py` handles CSV encoding fallback, column alias normalization, dtype coercion, and schema validation
+- `features.py` builds derived features plus aggregate horse, jockey, trainer, distance-band, and grade features
+- `hybrid_model.py` combines a CatBoost ranker, a CatBoost classifier, and scikit-learn regression/classification ensembles
+- `simulation.py` estimates rank distributions with Plackett-Luce and Gaussian-style simulations
+- `workflow.py` merges `config.yaml` and `race.yaml`, then orchestrates prediction and settlement
 
 ## Directory Layout
 
@@ -140,44 +185,34 @@ After `settle`, you can inspect `post_race_report.json` to compare predicted lea
 .
 ├── main.py
 ├── pyproject.toml
+├── README.md
+├── README.en.md
 ├── data/
 │   └── training/
 │       └── race_results_master.csv
 ├── outputs/
-│   └── Hanshin Daishoten/
+│   ├── Hanshin Daishoten/
+│   └── Takamatsunomiya Kinen/
 ├── races/
-│   └── hanshin-daishoten-2026-03-22/
-│       ├── README.md
-│       ├── entry.csv
-│       ├── history.csv
-│       ├── race.yaml
-│       ├── refresh_race_data.py
-│       └── result.csv
-└── src/
-    └── keiba_predictor/
-        ├── config.yaml
-        ├── data_loader.py
-        ├── features.py
-        ├── hybrid_model.py
-        ├── model.py
-        ├── prediction.py
-        ├── simulation.py
-        └── workflow.py
+│   ├── hanshin-daishoten-2026-03-22/
+│   └── takamatsunomiya-kinen-2026-03-29/
+├── src/
+│   └── keiba_predictor/
+│       ├── config.yaml
+│       ├── data_loader.py
+│       ├── features.py
+│       ├── hybrid_model.py
+│       ├── model.py
+│       ├── prediction.py
+│       ├── simulation.py
+│       └── workflow.py
+└── tests/
+    ├── test_data_loader.py
+    ├── test_features.py
+    ├── test_hybrid_model.py
+    ├── test_model.py
+    └── test_workflow.py
 ```
-
-## Key Output Files
-
-| File | Description |
-| --- | --- |
-| `predictions.csv` | Full prediction table for all horses |
-| `recommended_axis_horse.json` | Detailed payload for the selected axis horse |
-| `evaluation_summary.json` | Aggregated CV metrics |
-| `cv_fold_metrics.csv` | Fold-level evaluation output |
-| `feature_importance.csv` | Feature importance ranking |
-| `calibration_curve.csv` | Probability calibration summary |
-| `simulation_diagnostics.csv` | Simulation convergence diagnostics |
-| `settled_entry.csv` | Race card with finish ranks attached |
-| `post_race_report.json` | Comparison between predicted leaders and actual results |
 
 ## License
 

@@ -44,7 +44,19 @@ RACE_DATA_COLUMNS = [
     "days_since_last",
     "finish_rank",
 ]
-RESULT_TEMPLATE_COLUMNS = ["horse_id", "horse_name", "finish_rank"]
+RESULT_TEMPLATE_COLUMNS = [
+    "horse_id",
+    "horse_name",
+    "finish_rank",
+    "result_time",
+    "result_margin",
+    "result_last3f",
+    "result_final_odds",
+    "result_final_popularity",
+    "result_body_weight",
+    "result_body_weight_diff",
+]
+RESULT_META_FILENAME = "race_result_meta.json"
 SEASON_BY_MONTH = {
     1: "winter",
     2: "winter",
@@ -76,6 +88,85 @@ def find_existing_path(*candidates: Path) -> Path:
         if candidate.exists():
             return candidate
     raise FileNotFoundError("必要ファイルが見つかりません: " + ", ".join(str(path) for path in candidates))
+
+
+def _parse_race_time_to_seconds(value: object) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if ":" not in text:
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    try:
+        minutes_text, seconds_text = text.split(":", 1)
+        return (float(minutes_text) * 60.0) + float(seconds_text)
+    except ValueError:
+        return None
+
+
+def _coerce_optional_result_columns(result_df: pd.DataFrame) -> pd.DataFrame:
+    normalized = result_df.copy()
+
+    int_like_columns = [
+        "result_final_popularity",
+        "result_body_weight",
+        "result_body_weight_diff",
+    ]
+    float_like_columns = [
+        "result_last3f",
+        "result_final_odds",
+    ]
+
+    for column in int_like_columns + float_like_columns:
+        if column not in normalized.columns:
+            continue
+        raw = normalized[column]
+        text = raw.astype("string").str.strip()
+        text = text.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA})
+        parsed = pd.to_numeric(text, errors="coerce")
+        invalid_mask = text.notna() & parsed.isna()
+        if invalid_mask.any():
+            sample = text[invalid_mask].iloc[0]
+            raise SystemExit(f"[ERROR] result.csv の {column} に数値でない値があります: {sample}")
+        normalized[column] = parsed
+        if column in int_like_columns:
+            normalized[column] = normalized[column].astype("Int64")
+
+    if "result_time" in normalized.columns:
+        time_text = normalized["result_time"].astype("string").str.strip()
+        time_text = time_text.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "NaN": pd.NA})
+        parsed_seconds = time_text.map(_parse_race_time_to_seconds)
+        invalid_mask = time_text.notna() & parsed_seconds.isna()
+        if invalid_mask.any():
+            sample = time_text[invalid_mask].iloc[0]
+            raise SystemExit(f"[ERROR] result.csv の result_time に時刻として解釈できない値があります: {sample}")
+        normalized["result_time_seconds"] = parsed_seconds.astype(float)
+
+    return normalized
+
+
+def load_result_meta(race_dir: Path) -> Dict[str, object] | None:
+    meta_path = race_dir / RESULT_META_FILENAME
+    if not meta_path.exists():
+        return None
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"[ERROR] {meta_path.name} の JSON 解析に失敗しました: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"[ERROR] {meta_path.name} は JSON object である必要があります。")
+
+    meta = dict(payload)
+    winning_time = meta.get("winning_time")
+    if winning_time and "winning_time_seconds" not in meta:
+        seconds = _parse_race_time_to_seconds(winning_time)
+        if seconds is not None:
+            meta["winning_time_seconds"] = seconds
+    return meta
 
 
 def resolve_race_directory(races_root: Path, race: str | None, race_dir: str | None) -> Path:
@@ -271,7 +362,7 @@ def predict_race(
 
 
 def validate_result_frame(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
-    normalized = result_df.copy()
+    normalized = _coerce_optional_result_columns(result_df)
     if "race_id" not in normalized.columns:
         race_ids = entry_df["race_id"].dropna().astype("string").unique().tolist()
         if len(race_ids) != 1:
@@ -320,7 +411,8 @@ def build_settled_entry(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.D
     base["horse_id"] = base["horse_id"].astype("string")
     if "finish_rank" in base.columns:
         base = base.drop(columns=["finish_rank"])
-    result_keys = result_df[["race_id", "horse_id", "finish_rank"]].copy()
+    result_merge_columns = [col for col in result_df.columns if col != "horse_name"]
+    result_keys = result_df[result_merge_columns].copy()
     result_keys["race_id"] = result_keys["race_id"].astype("string")
     result_keys["horse_id"] = result_keys["horse_id"].astype("string")
     return base.merge(result_keys, on=["race_id", "horse_id"], how="left")
@@ -349,12 +441,47 @@ def load_predictions_frame(output_dir: Path) -> pd.DataFrame | None:
     return read_csv_safely(predictions_path)
 
 
+def _sort_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
+    ranked = predictions_df.copy()
+    ranked["horse_id"] = ranked["horse_id"].astype("string")
+    return ranked.sort_values(["consensus_top3_score", "top3_ci_width"], ascending=[False, True]).reset_index(drop=True)
+
+
+def build_post_race_analysis(
+    predictions_df: pd.DataFrame | None,
+    result_df: pd.DataFrame,
+) -> pd.DataFrame | None:
+    if predictions_df is None:
+        return None
+
+    ranked = _sort_predictions(predictions_df)
+    ranked["predicted_rank"] = range(1, len(ranked) + 1)
+    if "finish_rank" in ranked.columns:
+        ranked = ranked.drop(columns=["finish_rank"])
+
+    result_norm = result_df.copy()
+    result_norm["horse_id"] = result_norm["horse_id"].astype("string")
+    result_norm = result_norm.rename(columns={"finish_rank": "actual_finish_rank"})
+    result_merge_columns = [col for col in result_norm.columns if col != "horse_name"]
+    analysis = ranked.merge(result_norm[result_merge_columns], on=["race_id", "horse_id"], how="left")
+    analysis["actual_is_top3"] = analysis["actual_finish_rank"].le(3)
+    analysis["actual_is_win"] = analysis["actual_finish_rank"].eq(1)
+    analysis["predicted_is_top3"] = analysis["predicted_rank"].le(3)
+    analysis["rank_error"] = analysis["predicted_rank"] - analysis["actual_finish_rank"]
+    analysis["abs_rank_error"] = analysis["rank_error"].abs()
+    analysis["mean_rank_error"] = analysis["mean_rank"] - analysis["actual_finish_rank"]
+    analysis["abs_mean_rank_error"] = analysis["mean_rank_error"].abs()
+    return analysis.sort_values(["actual_finish_rank", "predicted_rank"], na_position="last").reset_index(drop=True)
+
+
 def build_post_race_report(
     predictions_df: pd.DataFrame | None,
     settled_entry_df: pd.DataFrame,
     result_df: pd.DataFrame,
     is_full_result: bool,
     appended_to_training_history: bool,
+    race_meta: Dict[str, object] | None = None,
+    analysis_df: pd.DataFrame | None = None,
 ) -> Dict[str, object]:
     result_norm = result_df.copy()
     result_norm["horse_id"] = result_norm["horse_id"].astype("string")
@@ -369,18 +496,19 @@ def build_post_race_report(
         if "horse_name" in actual_top3.columns
         else actual_top3[["horse_id", "finish_rank"]].to_dict(orient="records"),
     }
+    if race_meta:
+        report["race_meta"] = race_meta
 
     if predictions_df is None:
         report["prediction_status"] = "predictions.csv not found"
         return report
 
-    ranked = predictions_df.copy()
-    ranked["horse_id"] = ranked["horse_id"].astype("string")
-    ranked = ranked.sort_values(["consensus_top3_score", "top3_ci_width"], ascending=[False, True]).reset_index(drop=True)
+    ranked = _sort_predictions(predictions_df)
     predicted_top3 = ranked.head(3)
     predicted_top3_ids = set(predicted_top3["horse_id"].astype("string"))
     actual_top3_ids = set(result_norm[result_norm["finish_rank"] <= 3]["horse_id"].astype("string"))
     axis_row = ranked.iloc[0]
+    winner_row = result_norm.sort_values("finish_rank").iloc[0]
 
     report["predicted_top3"] = predicted_top3[
         ["horse_id", "horse_display_name", "consensus_top3_score", "top3_prob", "win_prob"]
@@ -390,16 +518,62 @@ def build_post_race_report(
         "horse_display_name": str(axis_row["horse_display_name"]),
         "consensus_top3_score": float(axis_row["consensus_top3_score"]),
     }
+    actual_winner: Dict[str, object] = {}
+    for key in [col for col in ["horse_id", "horse_name", "finish_rank", "result_time", "result_time_seconds"] if col in winner_row.index]:
+        value = winner_row[key]
+        if pd.isna(value):
+            continue
+        if key in {"horse_id", "horse_name", "result_time"}:
+            actual_winner[key] = str(value)
+        elif key == "finish_rank":
+            actual_winner[key] = int(value)
+        elif key.endswith("_seconds"):
+            actual_winner[key] = float(value)
+        else:
+            actual_winner[key] = value
+    report["actual_winner"] = actual_winner
     report["top3_overlap_count"] = int(len(predicted_top3_ids & actual_top3_ids))
     report["axis_hit_top3"] = bool(str(axis_row["horse_id"]) in actual_top3_ids)
 
-    merged = ranked.merge(
-        result_norm[["horse_id", "finish_rank"]].rename(columns={"finish_rank": "actual_finish_rank"}),
-        on="horse_id",
-        how="inner",
-    )
-    if len(merged) > 0:
-        report["known_rank_mean_abs_error"] = float((merged["mean_rank"] - merged["actual_finish_rank"]).abs().mean())
+    if analysis_df is not None and len(analysis_df) > 0:
+        valid = analysis_df[analysis_df["actual_finish_rank"].notna()].copy()
+        if len(valid) > 0:
+            report["prediction_status"] = "ok"
+            report["known_rank_mean_abs_error"] = float(valid["abs_mean_rank_error"].mean())
+            report["rank_order_mean_abs_error"] = float(valid["abs_rank_error"].mean())
+            report["top3_brier_score"] = float(((valid["top3_prob"] - valid["actual_is_top3"].astype(float)) ** 2).mean())
+            report["win_brier_score"] = float(((valid["win_prob"] - valid["actual_is_win"].astype(float)) ** 2).mean())
+            spearman = valid["predicted_rank"].corr(valid["actual_finish_rank"], method="spearman")
+            if pd.notna(spearman):
+                report["rank_spearman"] = float(spearman)
+
+            axis_analysis = valid.loc[valid["horse_id"].astype("string") == str(axis_row["horse_id"])]
+            if len(axis_analysis) > 0:
+                report["axis_finish_rank"] = int(axis_analysis.iloc[0]["actual_finish_rank"])
+
+            winner_analysis = valid.loc[valid["horse_id"].astype("string") == str(winner_row["horse_id"])]
+            if len(winner_analysis) > 0:
+                winner_analysis_row = winner_analysis.iloc[0]
+                report["winner_predicted_rank"] = int(winner_analysis_row["predicted_rank"])
+                report["winner_mean_rank"] = float(winner_analysis_row["mean_rank"])
+                report["winner_win_prob"] = float(winner_analysis_row["win_prob"])
+                report["winner_top3_prob"] = float(winner_analysis_row["top3_prob"])
+
+            miss_columns = [
+                "horse_id",
+                "horse_display_name",
+                "predicted_rank",
+                "actual_finish_rank",
+                "mean_rank",
+                "rank_error",
+                "mean_rank_error",
+                "top3_prob",
+                "win_prob",
+            ]
+            report["largest_prediction_gaps"] = valid.sort_values(
+                ["abs_rank_error", "abs_mean_rank_error"],
+                ascending=[False, False],
+            )[miss_columns].head(5).to_dict(orient="records")
     return report
 
 
@@ -429,20 +603,29 @@ def settle_race(
         appended_to_training_history = True
 
     predictions_df = load_predictions_frame(output_dir)
+    analysis_df = build_post_race_analysis(predictions_df=predictions_df, result_df=result_df)
+    analysis_path = None
+    if analysis_df is not None:
+        analysis_path = output_dir / "post_race_analysis.csv"
+        analysis_df.to_csv(analysis_path, index=False, encoding="utf-8-sig")
     if "horse_name" not in result_df.columns and "horse_name" in entry_df.columns:
         result_df = result_df.merge(entry_df[["horse_id", "horse_name"]], on="horse_id", how="left")
+    result_meta = load_result_meta(race_dir)
     report = build_post_race_report(
         predictions_df=predictions_df,
         settled_entry_df=settled_entry_df,
         result_df=result_df,
         is_full_result=is_full_result,
         appended_to_training_history=appended_to_training_history,
+        race_meta=result_meta,
+        analysis_df=analysis_df,
     )
     save_json(output_dir / "post_race_report.json", report)
 
     summary = {
         "result_path": str(result_path),
         "settled_entry_path": str(settled_entry_path),
+        "post_race_analysis_path": str(analysis_path) if analysis_path is not None else None,
         "post_race_report_path": str(output_dir / "post_race_report.json"),
         "is_full_result": is_full_result,
         "appended_to_training_history": appended_to_training_history,

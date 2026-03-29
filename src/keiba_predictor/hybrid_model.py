@@ -271,16 +271,31 @@ def fit_ranker_model(
     sorted_train = train_df.loc[order].reset_index(drop=True)
     sorted_weight = pd.Series(sample_weight, index=train_df.index).loc[order].to_numpy(dtype=float)
     x = prepare_catboost_frame(sorted_train, feature_cols, categorical_cols)
+    y = sorted_train["finish_percentile"].to_numpy(dtype=float)
+    group = sorted_train["race_id"].astype(str)
 
+    early_stopping = int(config.get("model", {}).get("ranker", {}).get("early_stopping_rounds", 0))
     model = _build_ranker(random_state=random_state, config=config)
-    model.fit(
-        x,
-        sorted_train["finish_percentile"].to_numpy(dtype=float),
-        group_id=sorted_train["race_id"].astype(str),
-        cat_features=categorical_cols,
-        sample_weight=sorted_weight,
-        verbose=False,
-    )
+
+    if early_stopping > 0 and len(sorted_train) >= 40:
+        n_train = int(len(sorted_train) * 0.85)
+        model.fit(
+            x.iloc[:n_train], y[:n_train],
+            group_id=group.iloc[:n_train],
+            eval_set=(x.iloc[n_train:], y[n_train:]),
+            cat_features=categorical_cols,
+            sample_weight=sorted_weight[:n_train],
+            early_stopping_rounds=early_stopping,
+            verbose=False,
+        )
+    else:
+        model.fit(
+            x, y,
+            group_id=group,
+            cat_features=categorical_cols,
+            sample_weight=sorted_weight,
+            verbose=False,
+        )
     return CatBoostRaceRankerModel(
         model=model,
         feature_cols=list(feature_cols),
@@ -297,14 +312,29 @@ def fit_classifier_model(
 ) -> CatBoostTop3ClassifierModel:
     _, categorical_cols = infer_column_types(train_df, feature_cols)
     x = prepare_catboost_frame(train_df, feature_cols, categorical_cols)
+    y = train_df["is_top3"].to_numpy(dtype=int)
+    sw = np.asarray(sample_weight, dtype=float)
+
+    early_stopping = int(config.get("model", {}).get("classifier", {}).get("early_stopping_rounds", 0))
     model = _build_classifier(random_state=random_state, config=config)
-    model.fit(
-        x,
-        train_df["is_top3"].to_numpy(dtype=int),
-        cat_features=categorical_cols,
-        sample_weight=np.asarray(sample_weight, dtype=float),
-        verbose=False,
-    )
+
+    if early_stopping > 0 and len(train_df) >= 40:
+        n_train = int(len(train_df) * 0.85)
+        model.fit(
+            x.iloc[:n_train], y[:n_train],
+            eval_set=(x.iloc[n_train:], y[n_train:]),
+            cat_features=categorical_cols,
+            sample_weight=sw[:n_train],
+            early_stopping_rounds=early_stopping,
+            verbose=False,
+        )
+    else:
+        model.fit(
+            x, y,
+            cat_features=categorical_cols,
+            sample_weight=sw,
+            verbose=False,
+        )
     return CatBoostTop3ClassifierModel(
         model=model,
         feature_cols=list(feature_cols),
@@ -351,9 +381,11 @@ def fit_score_temperature(
             seed=seed + (idx * 97),
             block_size=block_size,
         )
-        combined_loss = (0.7 * log_loss(y_arr, np.clip(prob, EPSILON, 1.0 - EPSILON))) + (
-            0.3 * brier_score_loss(y_arr, prob)
-        )
+        brier = brier_score_loss(y_arr, prob)
+        if len(y_arr) < 100:
+            combined_loss = brier
+        else:
+            combined_loss = (0.7 * log_loss(y_arr, np.clip(prob, EPSILON, 1.0 - EPSILON))) + (0.3 * brier)
         if combined_loss < best_loss:
             best_loss = float(combined_loss)
             best_temp = float(temp)
@@ -499,18 +531,14 @@ def _generate_internal_oof(
     sw_series = pd.Series(sample_weight, index=train_df.index)
     frames: List[pd.DataFrame] = []
 
+    min_rows_for_complex_models = 30
+
     for fold_no, (tr_idx, va_idx) in enumerate(splits, start=1):
         inner_train = train_df.iloc[tr_idx].reset_index(drop=True)
         inner_val = train_df.iloc[va_idx].reset_index(drop=True)
         inner_weight = sw_series.iloc[tr_idx].to_numpy(dtype=float)
+        use_complex = len(inner_train) >= min_rows_for_complex_models
 
-        rank_model = fit_ranker_model(
-            inner_train,
-            feature_cols=feature_cols,
-            sample_weight=inner_weight,
-            random_state=random_state + (fold_no * 100),
-            config=config,
-        )
         classifier_model = fit_classifier_model(
             inner_train,
             feature_cols=feature_cols,
@@ -518,43 +546,59 @@ def _generate_internal_oof(
             random_state=random_state + (fold_no * 100) + 1,
             config=config,
         )
-        regression_model = fit_regression_ensemble(
-            inner_train,
-            feature_cols=feature_cols,
-            y=inner_train["finish_percentile"].to_numpy(dtype=float),
-            sample_weight=inner_weight,
-            random_state=random_state + (fold_no * 100) + 2,
-            config=config,
-        )
-        auxiliary_classifier_model = fit_calibrated_classifier(
-            inner_train,
-            feature_cols=feature_cols,
-            y=inner_train["is_top3"].to_numpy(dtype=int),
-            sample_weight=inner_weight,
-            random_state=random_state + (fold_no * 100) + 3,
-            config=config,
-        )
 
         fold_frame = inner_val[["race_id", "is_top3", "finish_rank"]].copy()
         if "odds" in inner_val.columns:
             fold_frame["odds"] = pd.to_numeric(inner_val["odds"], errors="coerce")
         fold_frame["fold"] = fold_no
-        fold_frame["rank_score_raw"] = rank_model.predict_scores(inner_val)
         fold_frame["classifier_top3_prob"] = classifier_model.predict_proba(inner_val)
-        fold_frame["aux_classifier_top3_prob"] = auxiliary_classifier_model.predict_proba(inner_val)
-        regression_mu, regression_sigma = _regression_posterior_stats(regression_model, inner_val)
-        fold_frame["regression_mu"] = regression_mu
-        fold_frame["regression_sigma"] = regression_sigma
 
-        if has_shadow:
-            shadow_model = fit_ranker_model(
+        if use_complex:
+            rank_model = fit_ranker_model(
                 inner_train,
-                feature_cols=no_odds_feature_cols,
+                feature_cols=feature_cols,
                 sample_weight=inner_weight,
-                random_state=random_state + (fold_no * 100) + 5,
+                random_state=random_state + (fold_no * 100),
                 config=config,
             )
-            fold_frame["shadow_rank_score_raw"] = shadow_model.predict_scores(inner_val)
+            regression_model = fit_regression_ensemble(
+                inner_train,
+                feature_cols=feature_cols,
+                y=inner_train["finish_percentile"].to_numpy(dtype=float),
+                sample_weight=inner_weight,
+                random_state=random_state + (fold_no * 100) + 2,
+                config=config,
+            )
+            auxiliary_classifier_model = fit_calibrated_classifier(
+                inner_train,
+                feature_cols=feature_cols,
+                y=inner_train["is_top3"].to_numpy(dtype=int),
+                sample_weight=inner_weight,
+                random_state=random_state + (fold_no * 100) + 3,
+                config=config,
+            )
+            fold_frame["rank_score_raw"] = rank_model.predict_scores(inner_val)
+            fold_frame["aux_classifier_top3_prob"] = auxiliary_classifier_model.predict_proba(inner_val)
+            regression_mu, regression_sigma = _regression_posterior_stats(regression_model, inner_val)
+            fold_frame["regression_mu"] = regression_mu
+            fold_frame["regression_sigma"] = regression_sigma
+
+            if has_shadow:
+                shadow_model = fit_ranker_model(
+                    inner_train,
+                    feature_cols=no_odds_feature_cols,
+                    sample_weight=inner_weight,
+                    random_state=random_state + (fold_no * 100) + 5,
+                    config=config,
+                )
+                fold_frame["shadow_rank_score_raw"] = shadow_model.predict_scores(inner_val)
+        else:
+            fold_frame["rank_score_raw"] = 0.0
+            fold_frame["aux_classifier_top3_prob"] = fold_frame["classifier_top3_prob"]
+            fold_frame["regression_mu"] = 0.5
+            fold_frame["regression_sigma"] = 0.2
+            if has_shadow:
+                fold_frame["shadow_rank_score_raw"] = 0.0
 
         frames.append(fold_frame)
 
@@ -706,6 +750,38 @@ def fit_hybrid_race_model(
     )
 
 
+def _adaptive_blend_weights(blender: ProbabilityBlender) -> Tuple[float, float]:
+    """Compute ranker vs regression blend weights from the blender's component quality.
+
+    If the blender uses a single best feature or only regression-based features,
+    the ranker gets zero weight. Otherwise, extract approximate weights from the
+    blender's inverse-loss weights or logistic model coefficients.
+    Falls back to 0.65/0.35 when the blender provides no information.
+    """
+    if blender.weights is not None and len(blender.feature_cols) > 1:
+        rank_idx = None
+        reg_idx = None
+        for i, col in enumerate(blender.feature_cols):
+            if "rank" in col and "shadow" not in col:
+                rank_idx = i
+            elif "regression" in col:
+                reg_idx = i
+        if rank_idx is not None and reg_idx is not None:
+            rw = float(blender.weights[rank_idx])
+            gw = float(blender.weights[reg_idx])
+            total = rw + gw
+            if total > 0:
+                return rw / total, gw / total
+    if len(blender.feature_cols) == 1:
+        col = blender.feature_cols[0]
+        if "regression" in col:
+            return 0.0, 1.0
+        if "rank" in col:
+            return 1.0, 0.0
+        return 0.5, 0.5
+    return 0.65, 0.35
+
+
 def predict_hybrid_model(
     model: HybridRaceModel,
     entry_df: pd.DataFrame,
@@ -795,9 +871,10 @@ def predict_hybrid_model(
     component_df["ensemble_top3_prob"] = model.blender.predict_proba(component_df)
     component_df["calibrated_top3_prob"] = component_df["ensemble_top3_prob"]
     if not regression_sim_df.empty:
-        component_df["win_prob"] = (0.65 * component_df["win_prob"]) + (0.35 * component_df["regression_win_prob"])
-        component_df["top2_prob"] = (0.65 * component_df["top2_prob"]) + (0.35 * component_df["regression_top2_prob"])
-        component_df["mean_rank"] = (0.65 * component_df["mean_rank"]) + (0.35 * component_df["regression_mean_rank"])
+        ranker_w, regression_w = _adaptive_blend_weights(model.blender)
+        component_df["win_prob"] = (ranker_w * component_df["win_prob"]) + (regression_w * component_df["regression_win_prob"])
+        component_df["top2_prob"] = (ranker_w * component_df["top2_prob"]) + (regression_w * component_df["regression_top2_prob"])
+        component_df["mean_rank"] = (ranker_w * component_df["mean_rank"]) + (regression_w * component_df["regression_mean_rank"])
         component_df["top3_ci_low"] = np.minimum(component_df["top3_ci_low"], component_df["regression_top3_ci_low"])
         component_df["top3_ci_high"] = np.maximum(component_df["top3_ci_high"], component_df["regression_top3_ci_high"])
         component_df["top3_ci_width"] = component_df["top3_ci_high"] - component_df["top3_ci_low"]
