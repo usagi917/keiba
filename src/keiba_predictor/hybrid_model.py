@@ -5,7 +5,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from catboost import CatBoostClassifier, CatBoostRanker
+from catboost import CatBoostClassifier, CatBoostRanker, Pool
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss
@@ -259,6 +259,26 @@ def _build_classifier(random_state: int, config: Dict[str, object]) -> CatBoostC
     return CatBoostClassifier(**params)
 
 
+def _resolve_group_holdout_split(group_ids: Sequence[object], train_fraction: float = 0.85) -> int | None:
+    groups = pd.Series(group_ids, dtype="string").reset_index(drop=True)
+    if len(groups) == 0:
+        return None
+
+    race_end_rows = np.flatnonzero(groups.ne(groups.shift(-1)).fillna(True).to_numpy()) + 1
+    if len(race_end_rows) < 2:
+        return None
+
+    target_row = max(1, min(len(groups) - 1, int(np.ceil(len(groups) * train_fraction))))
+    boundary_idx = int(np.searchsorted(race_end_rows, target_row, side="left"))
+    if boundary_idx >= len(race_end_rows) - 1:
+        boundary_idx = len(race_end_rows) - 2
+
+    split_row = int(race_end_rows[boundary_idx])
+    if split_row <= 0 or split_row >= len(groups):
+        return None
+    return split_row
+
+
 def fit_ranker_model(
     train_df: pd.DataFrame,
     feature_cols: Sequence[str],
@@ -276,24 +296,42 @@ def fit_ranker_model(
 
     early_stopping = int(config.get("model", {}).get("ranker", {}).get("early_stopping_rounds", 0))
     model = _build_ranker(random_state=random_state, config=config)
+    full_pool = Pool(
+        x,
+        y,
+        group_id=group,
+        cat_features=categorical_cols,
+        weight=sorted_weight,
+    )
 
+    split_row = None
     if early_stopping > 0 and len(sorted_train) >= 40:
-        n_train = int(len(sorted_train) * 0.85)
-        model.fit(
-            x.iloc[:n_train], y[:n_train],
-            group_id=group.iloc[:n_train],
-            eval_set=(x.iloc[n_train:], y[n_train:]),
+        split_row = _resolve_group_holdout_split(group, train_fraction=0.85)
+
+    if split_row is not None:
+        train_pool = Pool(
+            x.iloc[:split_row],
+            y[:split_row],
+            group_id=group.iloc[:split_row],
             cat_features=categorical_cols,
-            sample_weight=sorted_weight[:n_train],
+            weight=sorted_weight[:split_row],
+        )
+        eval_pool = Pool(
+            x.iloc[split_row:],
+            y[split_row:],
+            group_id=group.iloc[split_row:],
+            cat_features=categorical_cols,
+            weight=sorted_weight[split_row:],
+        )
+        model.fit(
+            train_pool,
+            eval_set=eval_pool,
             early_stopping_rounds=early_stopping,
             verbose=False,
         )
     else:
         model.fit(
-            x, y,
-            group_id=group,
-            cat_features=categorical_cols,
-            sample_weight=sorted_weight,
+            full_pool,
             verbose=False,
         )
     return CatBoostRaceRankerModel(

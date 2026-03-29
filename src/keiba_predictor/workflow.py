@@ -464,6 +464,10 @@ def build_post_race_analysis(
     result_norm = result_norm.rename(columns={"finish_rank": "actual_finish_rank"})
     result_merge_columns = [col for col in result_norm.columns if col != "horse_name"]
     analysis = ranked.merge(result_norm[result_merge_columns], on=["race_id", "horse_id"], how="left")
+    if "consensus_top3_score" in analysis.columns:
+        analysis["published_top3_prob"] = pd.to_numeric(analysis["consensus_top3_score"], errors="coerce")
+    else:
+        analysis["published_top3_prob"] = pd.to_numeric(analysis["top3_prob"], errors="coerce")
     analysis["actual_is_top3"] = analysis["actual_finish_rank"].le(3)
     analysis["actual_is_win"] = analysis["actual_finish_rank"].eq(1)
     analysis["predicted_is_top3"] = analysis["predicted_rank"].le(3)
@@ -509,6 +513,8 @@ def build_post_race_report(
     actual_top3_ids = set(result_norm[result_norm["finish_rank"] <= 3]["horse_id"].astype("string"))
     axis_row = ranked.iloc[0]
     winner_row = result_norm.sort_values("finish_rank").iloc[0]
+    if "selected_top3_model" in ranked.columns and ranked["selected_top3_model"].notna().any():
+        report["selected_top3_model"] = str(ranked["selected_top3_model"].dropna().iloc[0])
 
     report["predicted_top3"] = predicted_top3[
         ["horse_id", "horse_display_name", "consensus_top3_score", "top3_prob", "win_prob"]
@@ -541,7 +547,7 @@ def build_post_race_report(
             report["prediction_status"] = "ok"
             report["known_rank_mean_abs_error"] = float(valid["abs_mean_rank_error"].mean())
             report["rank_order_mean_abs_error"] = float(valid["abs_rank_error"].mean())
-            report["top3_brier_score"] = float(((valid["top3_prob"] - valid["actual_is_top3"].astype(float)) ** 2).mean())
+            report["top3_brier_score"] = float(((valid["published_top3_prob"] - valid["actual_is_top3"].astype(float)) ** 2).mean())
             report["win_brier_score"] = float(((valid["win_prob"] - valid["actual_is_win"].astype(float)) ** 2).mean())
             spearman = valid["predicted_rank"].corr(valid["actual_finish_rank"], method="spearman")
             if pd.notna(spearman):
@@ -557,7 +563,7 @@ def build_post_race_report(
                 report["winner_predicted_rank"] = int(winner_analysis_row["predicted_rank"])
                 report["winner_mean_rank"] = float(winner_analysis_row["mean_rank"])
                 report["winner_win_prob"] = float(winner_analysis_row["win_prob"])
-                report["winner_top3_prob"] = float(winner_analysis_row["top3_prob"])
+                report["winner_top3_prob"] = float(winner_analysis_row["published_top3_prob"])
 
             miss_columns = [
                 "horse_id",
@@ -567,9 +573,11 @@ def build_post_race_report(
                 "mean_rank",
                 "rank_error",
                 "mean_rank_error",
-                "top3_prob",
+                "published_top3_prob",
                 "win_prob",
             ]
+            if "selected_top3_model" in valid.columns:
+                miss_columns.insert(2, "selected_top3_model")
             report["largest_prediction_gaps"] = valid.sort_values(
                 ["abs_rank_error", "abs_mean_rank_error"],
                 ascending=[False, False],
