@@ -356,13 +356,17 @@ def fit_classifier_model(
     early_stopping = int(config.get("model", {}).get("classifier", {}).get("early_stopping_rounds", 0))
     model = _build_classifier(random_state=random_state, config=config)
 
-    if early_stopping > 0 and len(train_df) >= 40:
-        n_train = int(len(train_df) * 0.85)
+    split_row = None
+    if early_stopping > 0 and len(train_df) >= 40 and "race_id" in train_df.columns:
+        group_ids = train_df["race_id"].astype(str).tolist()
+        split_row = _resolve_group_holdout_split(group_ids, train_fraction=0.85)
+
+    if split_row is not None:
         model.fit(
-            x.iloc[:n_train], y[:n_train],
-            eval_set=(x.iloc[n_train:], y[n_train:]),
+            x.iloc[:split_row], y[:split_row],
+            eval_set=(x.iloc[split_row:], y[split_row:]),
             cat_features=categorical_cols,
-            sample_weight=sw[:n_train],
+            sample_weight=sw[:split_row],
             early_stopping_rounds=early_stopping,
             verbose=False,
         )

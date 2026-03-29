@@ -141,7 +141,7 @@ def _prepare_top3_dashboard_frame(pred_df: pd.DataFrame) -> pd.DataFrame:
     return ordered.sort_values(["published_top3_prob", "win_prob"], ascending=[False, False]).reset_index(drop=True)
 
 
-def save_top3_bar_chart(pred_df: pd.DataFrame, outdir: Path, axis_horse_id: str) -> Path:
+def save_top3_bar_chart(pred_df: pd.DataFrame, outdir: Path, axis_horse_id: str, race_name: str = "") -> Path:
     ordered = _prepare_top3_dashboard_frame(pred_df).head(12)
     plot_df = ordered.iloc[::-1].copy()
     plot_df["label"] = plot_df["horse_number"].astype(int).astype(str) + " " + plot_df["horse_display_name"].astype(str)
@@ -223,7 +223,8 @@ def save_top3_bar_chart(pred_df: pd.DataFrame, outdir: Path, axis_horse_id: str)
             cell.get_text().set_text(f'{summary_df.iloc[row_idx - 1]["馬"]}  <- 軸')
 
     ax_table.set_title("上位8頭サマリー", loc="left", fontsize=12, fontweight="bold")
-    fig.suptitle("高松宮記念 予測ダッシュボード", x=0.125, y=0.975, ha="left", fontsize=17, fontweight="bold")
+    dashboard_title = f"{race_name} 予測ダッシュボード" if race_name else "予測ダッシュボード"
+    fig.suptitle(dashboard_title, x=0.125, y=0.975, ha="left", fontsize=17, fontweight="bold")
     fig.text(0.125, 0.935, subtitle, fontsize=10, color="#52606d")
     fig.subplots_adjust(top=0.88, bottom=0.08, left=0.12, right=0.98)
     filepath = outdir / "top3_probability_bar.png"
@@ -413,7 +414,8 @@ def write_prediction_outputs(
     with open(axis_path, "w", encoding="utf-8") as f:
         json.dump(axis_row.to_dict(), f, ensure_ascii=False, indent=2, default=str)
 
-    top3_plot_path = save_top3_bar_chart(pred_df, outdir, axis_horse_id=str(axis_row["horse_id"]))
+    race_name = str(config.get("target_race_profile", {}).get("name", ""))
+    top3_plot_path = save_top3_bar_chart(pred_df, outdir, axis_horse_id=str(axis_row["horse_id"]), race_name=race_name)
     calibration_plot_path = save_calibration_plot(eval_result["calibration_curve"], outdir)
     feature_plot_path = save_feature_importance_plot(
         feature_importance_df,

@@ -1,9 +1,9 @@
 # keiba-axis-model
 
-[English](README.en.md)
-Python 3.10+
-uv
-[License: MIT](LICENSE)
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](README.en.md)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![uv](https://img.shields.io/badge/package%20manager-uv-4B5563)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > レース単位の入力ディレクトリを起点に、Top 3 確率、軸馬候補、レース後の振り返りレポートを生成する競馬予測ワークフローです。
 
