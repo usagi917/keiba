@@ -18,27 +18,29 @@ model:
   ranker:
     loss_function: QueryRMSE
     eval_metric: NDCG:top=3
-    iterations: 500
-    learning_rate: 0.05
-    depth: 6
-    l2_leaf_reg: 8.0
-    random_strength: 0.5
-    min_data_in_leaf: 5
+    iterations: 300
+    learning_rate: 0.03
+    depth: 4
+    l2_leaf_reg: 12.0
+    random_strength: 1.5
+    min_data_in_leaf: 10
     bootstrap_type: Bernoulli
-    subsample: 0.8
+    subsample: 0.7
+    early_stopping_rounds: 50
     thread_count: -1
   classifier:
     loss_function: Logloss
     eval_metric: Logloss
-    iterations: 400
-    learning_rate: 0.05
-    depth: 6
-    l2_leaf_reg: 8.0
-    random_strength: 0.5
-    min_data_in_leaf: 5
+    iterations: 250
+    learning_rate: 0.03
+    depth: 4
+    l2_leaf_reg: 12.0
+    random_strength: 1.5
+    min_data_in_leaf: 10
     bootstrap_type: Bernoulli
-    subsample: 0.8
+    subsample: 0.7
     auto_class_weights: Balanced
+    early_stopping_rounds: 50
     thread_count: -1
     bases: [logistic, random_forest, extra_trees]
     logistic:
@@ -96,7 +98,7 @@ simulation:
   block_size: 50000
   calibration_trials: 8000
   calibration_block_size: 4000
-  temperature_grid: [0.35, 0.5, 0.65, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2]
+  temperature_grid: [0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.0]
 
 plot:
   calibration_bins: 10

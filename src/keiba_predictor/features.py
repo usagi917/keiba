@@ -15,15 +15,56 @@ MARKET_EDGE_PRIOR_MEAN = 0.0
 SMOOTHING_STRENGTH = 5.0
 RECENT_WINDOWS = (3, 5)
 
+DISTANCE_BANDS = {
+    "sprint": (0, 1400),
+    "mile": (1401, 1800),
+    "intermediate": (1801, 2200),
+    "long": (2201, 2800),
+    "stayer": (2801, 9999),
+}
+
+CLASS_RANK = {
+    "newcomer": 1, "新馬": 1,
+    "maiden": 2, "未勝利": 2,
+    "allowance": 3, "1勝": 3, "1win": 3,
+    "2win": 4, "2勝": 4,
+    "3win": 5, "3勝": 5,
+    "open": 6, "オープン": 6,
+}
+
+
+def get_distance_band(distance: object) -> Optional[str]:
+    try:
+        d = float(distance)
+    except Exception:
+        return None
+    for band, (lo, hi) in DISTANCE_BANDS.items():
+        if lo <= d <= hi:
+            return band
+    return None
+
+
+def is_graded(grade: object) -> bool:
+    if grade is None or pd.isna(grade):
+        return False
+    s = str(grade).strip().lower()
+    return any(token in s for token in ["g1", "g2", "g3", "重賞", "listed"])
+
 AGGREGATE_PREFIXES = [
     "horse_overall",
     "horse_surface",
     "horse_long_turf",
     "horse_course",
+    "horse_dist_band",
+    "horse_graded",
     "jockey_overall",
     "jockey_long_turf",
+    "jockey_dist_band",
+    "jockey_course",
+    "jockey_graded",
     "trainer_overall",
     "trainer_long_turf",
+    "trainer_dist_band",
 ]
 AGGREGATE_FEATURE_COLUMNS = [
     feature
@@ -103,6 +144,13 @@ RAW_MODEL_FEATURES = [
     "log_odds_field_delta",
     "last_finish_field_delta",
     "last_3f_field_delta",
+    "class_transition",
+    "is_class_up",
+    "is_class_down",
+    "is_fresh",
+    "is_layoff",
+    "last_3f_per_furlong",
+    "relative_3f_speed",
 ]
 
 ODDS_RELATED_FEATURES = {
@@ -354,6 +402,25 @@ def _add_row_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     if "body_weight_diff" in out.columns:
         out["body_weight_diff_missing"] = out["body_weight_diff"].isna().astype(float)
 
+    if {"class", "last_class"}.issubset(out.columns):
+        current_rank = out["class"].astype(str).str.strip().str.lower().map(CLASS_RANK)
+        previous_rank = out["last_class"].astype(str).str.strip().str.lower().map(CLASS_RANK)
+        out["class_transition"] = current_rank - previous_rank
+        out["is_class_up"] = (out["class_transition"] > 0).astype(float)
+        out["is_class_down"] = (out["class_transition"] < 0).astype(float)
+
+    if "days_since_last" in out.columns:
+        rest = pd.to_numeric(out["days_since_last"], errors="coerce")
+        out["is_fresh"] = (rest <= 35).astype(float)
+        out["is_layoff"] = (rest >= 120).astype(float)
+
+    if "last_3f" in out.columns and "distance" in out.columns:
+        last_3f = pd.to_numeric(out["last_3f"], errors="coerce")
+        dist = pd.to_numeric(out["distance"], errors="coerce")
+        out["last_3f_per_furlong"] = last_3f / 3.0
+        furlongs = dist / 200.0
+        out["relative_3f_speed"] = last_3f / furlongs.replace(0, np.nan)
+
     return out
 
 
@@ -568,10 +635,16 @@ def _build_history_aggregate_features(history: pd.DataFrame) -> pd.DataFrame:
     horse_surface: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
     horse_long: Dict[str, RunningStats] = defaultdict(RunningStats)
     horse_course: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    horse_dist_band: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    horse_graded: Dict[str, RunningStats] = defaultdict(RunningStats)
     jockey_overall: Dict[str, RunningStats] = defaultdict(RunningStats)
     jockey_long: Dict[str, RunningStats] = defaultdict(RunningStats)
+    jockey_dist_band: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    jockey_course: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    jockey_graded: Dict[str, RunningStats] = defaultdict(RunningStats)
     trainer_overall: Dict[str, RunningStats] = defaultdict(RunningStats)
     trainer_long: Dict[str, RunningStats] = defaultdict(RunningStats)
+    trainer_dist_band: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
     horse_recent: Dict[str, List[Tuple[float, int, Optional[float]]]] = defaultdict(list)
 
     for _, day_df in work.groupby("_race_day", sort=True):
@@ -582,6 +655,7 @@ def _build_history_aggregate_features(history: pd.DataFrame) -> pd.DataFrame:
             trainer_key = _safe_key(getattr(row, "trainer", None))
             course_key = _safe_key(getattr(row, "course", None))
             surface_key = _safe_key(getattr(row, "surface", None))
+            dist_band = get_distance_band(getattr(row, "distance", None))
 
             _assign_stats(feature_store, pos, "horse_overall", horse_overall.get(horse_key))
             if horse_key is not None and surface_key is not None:
@@ -593,10 +667,28 @@ def _build_history_aggregate_features(history: pd.DataFrame) -> pd.DataFrame:
                 _assign_stats(feature_store, pos, "horse_course", horse_course.get((horse_key, course_key)))
             else:
                 _assign_stats(feature_store, pos, "horse_course", None)
+            if horse_key is not None and dist_band is not None:
+                _assign_stats(feature_store, pos, "horse_dist_band", horse_dist_band.get((horse_key, dist_band)))
+            else:
+                _assign_stats(feature_store, pos, "horse_dist_band", None)
+            _assign_stats(feature_store, pos, "horse_graded", horse_graded.get(horse_key))
             _assign_stats(feature_store, pos, "jockey_overall", jockey_overall.get(jockey_key))
             _assign_stats(feature_store, pos, "jockey_long_turf", jockey_long.get(jockey_key))
+            if jockey_key is not None and dist_band is not None:
+                _assign_stats(feature_store, pos, "jockey_dist_band", jockey_dist_band.get((jockey_key, dist_band)))
+            else:
+                _assign_stats(feature_store, pos, "jockey_dist_band", None)
+            if jockey_key is not None and course_key is not None:
+                _assign_stats(feature_store, pos, "jockey_course", jockey_course.get((jockey_key, course_key)))
+            else:
+                _assign_stats(feature_store, pos, "jockey_course", None)
+            _assign_stats(feature_store, pos, "jockey_graded", jockey_graded.get(jockey_key))
             _assign_stats(feature_store, pos, "trainer_overall", trainer_overall.get(trainer_key))
             _assign_stats(feature_store, pos, "trainer_long_turf", trainer_long.get(trainer_key))
+            if trainer_key is not None and dist_band is not None:
+                _assign_stats(feature_store, pos, "trainer_dist_band", trainer_dist_band.get((trainer_key, dist_band)))
+            else:
+                _assign_stats(feature_store, pos, "trainer_dist_band", None)
             _assign_recent_stats(feature_store, pos, horse_recent.get(horse_key))
 
         for row in day_df.itertuples():
@@ -608,6 +700,8 @@ def _build_history_aggregate_features(history: pd.DataFrame) -> pd.DataFrame:
             finish_pct = getattr(row, "finish_percentile")
             is_top3 = getattr(row, "is_top3")
             long_turf = is_long_turf(getattr(row, "surface", None), getattr(row, "distance", None))
+            dist_band = get_distance_band(getattr(row, "distance", None))
+            graded = is_graded(getattr(row, "grade", None))
             market_edge = _market_edge(
                 finish_percentile=finish_pct,
                 odds_rank_score=getattr(row, "odds_rank_score", None),
@@ -623,39 +717,66 @@ def _build_history_aggregate_features(history: pd.DataFrame) -> pd.DataFrame:
                     horse_long[horse_key].update(finish_pct, is_top3, market_edge=market_edge)
                 if course_key is not None:
                     horse_course[(horse_key, course_key)].update(finish_pct, is_top3, market_edge=market_edge)
+                if dist_band is not None:
+                    horse_dist_band[(horse_key, dist_band)].update(finish_pct, is_top3, market_edge=market_edge)
+                if graded:
+                    horse_graded[horse_key].update(finish_pct, is_top3, market_edge=market_edge)
             if jockey_key is not None:
                 jockey_overall[jockey_key].update(finish_pct, is_top3, market_edge=market_edge)
                 if long_turf:
                     jockey_long[jockey_key].update(finish_pct, is_top3, market_edge=market_edge)
+                if dist_band is not None:
+                    jockey_dist_band[(jockey_key, dist_band)].update(finish_pct, is_top3, market_edge=market_edge)
+                if course_key is not None:
+                    jockey_course[(jockey_key, course_key)].update(finish_pct, is_top3, market_edge=market_edge)
+                if graded:
+                    jockey_graded[jockey_key].update(finish_pct, is_top3, market_edge=market_edge)
             if trainer_key is not None:
                 trainer_overall[trainer_key].update(finish_pct, is_top3, market_edge=market_edge)
                 if long_turf:
                     trainer_long[trainer_key].update(finish_pct, is_top3, market_edge=market_edge)
+                if dist_band is not None:
+                    trainer_dist_band[(trainer_key, dist_band)].update(finish_pct, is_top3, market_edge=market_edge)
 
     for col, values in feature_store.items():
         work[col] = values
     return work.drop(columns=["_race_day"])
 
 
-def _build_final_lookups(history_subset: pd.DataFrame) -> Tuple[
-    Dict[str, RunningStats],
-    Dict[Tuple[str, str], RunningStats],
-    Dict[str, RunningStats],
-    Dict[Tuple[str, str], RunningStats],
-    Dict[str, RunningStats],
-    Dict[str, RunningStats],
-    Dict[str, RunningStats],
-    Dict[str, RunningStats],
-    Dict[str, List[Tuple[float, int, Optional[float]]]],
-]:
+@dataclass
+class AggregatedLookups:
+    horse_overall: Dict[str, RunningStats]
+    horse_surface: Dict[Tuple[str, str], RunningStats]
+    horse_long: Dict[str, RunningStats]
+    horse_course: Dict[Tuple[str, str], RunningStats]
+    horse_dist_band: Dict[Tuple[str, str], RunningStats]
+    horse_graded: Dict[str, RunningStats]
+    jockey_overall: Dict[str, RunningStats]
+    jockey_long: Dict[str, RunningStats]
+    jockey_dist_band: Dict[Tuple[str, str], RunningStats]
+    jockey_course: Dict[Tuple[str, str], RunningStats]
+    jockey_graded: Dict[str, RunningStats]
+    trainer_overall: Dict[str, RunningStats]
+    trainer_long: Dict[str, RunningStats]
+    trainer_dist_band: Dict[Tuple[str, str], RunningStats]
+    horse_recent: Dict[str, List[Tuple[float, int, Optional[float]]]]
+
+
+def _build_final_lookups(history_subset: pd.DataFrame) -> AggregatedLookups:
     horse_overall: Dict[str, RunningStats] = defaultdict(RunningStats)
     horse_surface: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
     horse_long: Dict[str, RunningStats] = defaultdict(RunningStats)
     horse_course: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    horse_dist_band: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    horse_graded: Dict[str, RunningStats] = defaultdict(RunningStats)
     jockey_overall: Dict[str, RunningStats] = defaultdict(RunningStats)
     jockey_long: Dict[str, RunningStats] = defaultdict(RunningStats)
+    jockey_dist_band: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    jockey_course: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
+    jockey_graded: Dict[str, RunningStats] = defaultdict(RunningStats)
     trainer_overall: Dict[str, RunningStats] = defaultdict(RunningStats)
     trainer_long: Dict[str, RunningStats] = defaultdict(RunningStats)
+    trainer_dist_band: Dict[Tuple[str, str], RunningStats] = defaultdict(RunningStats)
     horse_recent: Dict[str, List[Tuple[float, int, Optional[float]]]] = defaultdict(list)
 
     ordered = history_subset.sort_values(["race_date", "race_id"], kind="mergesort")
@@ -668,6 +789,8 @@ def _build_final_lookups(history_subset: pd.DataFrame) -> Tuple[
         finish_pct = getattr(row, "finish_percentile")
         is_top3 = getattr(row, "is_top3")
         long_turf = is_long_turf(getattr(row, "surface", None), getattr(row, "distance", None))
+        dist_band = get_distance_band(getattr(row, "distance", None))
+        graded = is_graded(getattr(row, "grade", None))
         market_edge = _market_edge(
             finish_percentile=finish_pct,
             odds_rank_score=getattr(row, "odds_rank_score", None),
@@ -683,25 +806,43 @@ def _build_final_lookups(history_subset: pd.DataFrame) -> Tuple[
                 horse_long[horse_key].update(finish_pct, is_top3, market_edge=market_edge)
             if course_key is not None:
                 horse_course[(horse_key, course_key)].update(finish_pct, is_top3, market_edge=market_edge)
+            if dist_band is not None:
+                horse_dist_band[(horse_key, dist_band)].update(finish_pct, is_top3, market_edge=market_edge)
+            if graded:
+                horse_graded[horse_key].update(finish_pct, is_top3, market_edge=market_edge)
         if jockey_key is not None:
             jockey_overall[jockey_key].update(finish_pct, is_top3, market_edge=market_edge)
             if long_turf:
                 jockey_long[jockey_key].update(finish_pct, is_top3, market_edge=market_edge)
+            if dist_band is not None:
+                jockey_dist_band[(jockey_key, dist_band)].update(finish_pct, is_top3, market_edge=market_edge)
+            if course_key is not None:
+                jockey_course[(jockey_key, course_key)].update(finish_pct, is_top3, market_edge=market_edge)
+            if graded:
+                jockey_graded[jockey_key].update(finish_pct, is_top3, market_edge=market_edge)
         if trainer_key is not None:
             trainer_overall[trainer_key].update(finish_pct, is_top3, market_edge=market_edge)
             if long_turf:
                 trainer_long[trainer_key].update(finish_pct, is_top3, market_edge=market_edge)
+            if dist_band is not None:
+                trainer_dist_band[(trainer_key, dist_band)].update(finish_pct, is_top3, market_edge=market_edge)
 
-    return (
-        horse_overall,
-        horse_surface,
-        horse_long,
-        horse_course,
-        jockey_overall,
-        jockey_long,
-        trainer_overall,
-        trainer_long,
-        horse_recent,
+    return AggregatedLookups(
+        horse_overall=horse_overall,
+        horse_surface=horse_surface,
+        horse_long=horse_long,
+        horse_course=horse_course,
+        horse_dist_band=horse_dist_band,
+        horse_graded=horse_graded,
+        jockey_overall=jockey_overall,
+        jockey_long=jockey_long,
+        jockey_dist_band=jockey_dist_band,
+        jockey_course=jockey_course,
+        jockey_graded=jockey_graded,
+        trainer_overall=trainer_overall,
+        trainer_long=trainer_long,
+        trainer_dist_band=trainer_dist_band,
+        horse_recent=horse_recent,
     )
 
 
@@ -717,17 +858,7 @@ def _build_entry_aggregate_features(entry: pd.DataFrame, history: pd.DataFrame) 
 
     for race_day, day_df in work.groupby("_race_day", sort=True):
         history_subset = history[pd.to_datetime(history["race_date"], errors="coerce").dt.normalize() < race_day]
-        (
-            horse_overall,
-            horse_surface,
-            horse_long,
-            horse_course,
-            jockey_overall,
-            jockey_long,
-            trainer_overall,
-            trainer_long,
-            horse_recent,
-        ) = _build_final_lookups(history_subset)
+        lookups = _build_final_lookups(history_subset)
 
         for row in day_df.itertuples():
             pos = int(row.Index)
@@ -736,22 +867,41 @@ def _build_entry_aggregate_features(entry: pd.DataFrame, history: pd.DataFrame) 
             trainer_key = _safe_key(getattr(row, "trainer", None))
             course_key = _safe_key(getattr(row, "course", None))
             surface_key = _safe_key(getattr(row, "surface", None))
+            dist_band = get_distance_band(getattr(row, "distance", None))
 
-            _assign_stats(feature_store, pos, "horse_overall", horse_overall.get(horse_key))
+            _assign_stats(feature_store, pos, "horse_overall", lookups.horse_overall.get(horse_key))
             if horse_key is not None and surface_key is not None:
-                _assign_stats(feature_store, pos, "horse_surface", horse_surface.get((horse_key, surface_key)))
+                _assign_stats(feature_store, pos, "horse_surface", lookups.horse_surface.get((horse_key, surface_key)))
             else:
                 _assign_stats(feature_store, pos, "horse_surface", None)
-            _assign_stats(feature_store, pos, "horse_long_turf", horse_long.get(horse_key))
+            _assign_stats(feature_store, pos, "horse_long_turf", lookups.horse_long.get(horse_key))
             if horse_key is not None and course_key is not None:
-                _assign_stats(feature_store, pos, "horse_course", horse_course.get((horse_key, course_key)))
+                _assign_stats(feature_store, pos, "horse_course", lookups.horse_course.get((horse_key, course_key)))
             else:
                 _assign_stats(feature_store, pos, "horse_course", None)
-            _assign_stats(feature_store, pos, "jockey_overall", jockey_overall.get(jockey_key))
-            _assign_stats(feature_store, pos, "jockey_long_turf", jockey_long.get(jockey_key))
-            _assign_stats(feature_store, pos, "trainer_overall", trainer_overall.get(trainer_key))
-            _assign_stats(feature_store, pos, "trainer_long_turf", trainer_long.get(trainer_key))
-            _assign_recent_stats(feature_store, pos, horse_recent.get(horse_key))
+            if horse_key is not None and dist_band is not None:
+                _assign_stats(feature_store, pos, "horse_dist_band", lookups.horse_dist_band.get((horse_key, dist_band)))
+            else:
+                _assign_stats(feature_store, pos, "horse_dist_band", None)
+            _assign_stats(feature_store, pos, "horse_graded", lookups.horse_graded.get(horse_key))
+            _assign_stats(feature_store, pos, "jockey_overall", lookups.jockey_overall.get(jockey_key))
+            _assign_stats(feature_store, pos, "jockey_long_turf", lookups.jockey_long.get(jockey_key))
+            if jockey_key is not None and dist_band is not None:
+                _assign_stats(feature_store, pos, "jockey_dist_band", lookups.jockey_dist_band.get((jockey_key, dist_band)))
+            else:
+                _assign_stats(feature_store, pos, "jockey_dist_band", None)
+            if jockey_key is not None and course_key is not None:
+                _assign_stats(feature_store, pos, "jockey_course", lookups.jockey_course.get((jockey_key, course_key)))
+            else:
+                _assign_stats(feature_store, pos, "jockey_course", None)
+            _assign_stats(feature_store, pos, "jockey_graded", lookups.jockey_graded.get(jockey_key))
+            _assign_stats(feature_store, pos, "trainer_overall", lookups.trainer_overall.get(trainer_key))
+            _assign_stats(feature_store, pos, "trainer_long_turf", lookups.trainer_long.get(trainer_key))
+            if trainer_key is not None and dist_band is not None:
+                _assign_stats(feature_store, pos, "trainer_dist_band", lookups.trainer_dist_band.get((trainer_key, dist_band)))
+            else:
+                _assign_stats(feature_store, pos, "trainer_dist_band", None)
+            _assign_recent_stats(feature_store, pos, lookups.horse_recent.get(horse_key))
 
     for col, values in feature_store.items():
         work[col] = values

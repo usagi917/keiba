@@ -10,7 +10,7 @@ outputs/
 # Race data (scraped from Sports Navi)
 races/**/*.csv
 data/training/
-
+races/
 # Claude Code
 .claude/
 
@@ -19,3 +19,4 @@ data/training/
 
 # Plans
 plans/
+tests/

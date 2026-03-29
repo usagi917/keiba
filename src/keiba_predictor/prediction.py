@@ -7,6 +7,8 @@ from typing import Dict
 
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import PercentFormatter
 import pandas as pd
 import yaml
 
@@ -130,17 +132,103 @@ def configure_matplotlib_fonts() -> None:
     plt.rcParams["axes.unicode_minus"] = False
 
 
-def save_top3_bar_chart(pred_df: pd.DataFrame, outdir: Path) -> Path:
-    ordered = pred_df.sort_values("consensus_top3_score", ascending=False).reset_index(drop=True)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(ordered["horse_display_name"], ordered["consensus_top3_score"])
-    ax.set_title("Final Top3 probability")
-    ax.set_ylabel("Probability")
-    ax.set_ylim(0.0, 1.0)
-    ax.tick_params(axis="x", rotation=45)
-    fig.tight_layout()
+def _prepare_top3_dashboard_frame(pred_df: pd.DataFrame) -> pd.DataFrame:
+    ordered = pred_df.copy()
+    if "consensus_top3_score" in ordered.columns:
+        ordered["published_top3_prob"] = pd.to_numeric(ordered["consensus_top3_score"], errors="coerce")
+    else:
+        ordered["published_top3_prob"] = pd.to_numeric(ordered["top3_prob"], errors="coerce")
+    return ordered.sort_values(["published_top3_prob", "win_prob"], ascending=[False, False]).reset_index(drop=True)
+
+
+def save_top3_bar_chart(pred_df: pd.DataFrame, outdir: Path, axis_horse_id: str, race_name: str = "") -> Path:
+    ordered = _prepare_top3_dashboard_frame(pred_df).head(12)
+    plot_df = ordered.iloc[::-1].copy()
+    plot_df["label"] = plot_df["horse_number"].astype(int).astype(str) + " " + plot_df["horse_display_name"].astype(str)
+
+    axis_horse_key = str(axis_horse_id)
+    bar_colors = ["#d1495b" if str(horse_id) == axis_horse_key else "#2f6db3" for horse_id in plot_df["horse_id"]]
+    selected_model = "consensus_top3_score"
+    if "selected_top3_model" in ordered.columns and ordered["selected_top3_model"].notna().any():
+        selected_model = str(ordered["selected_top3_model"].dropna().iloc[0])
+
+    fig = plt.figure(figsize=(15.5, 8))
+    grid = GridSpec(1, 2, figure=fig, width_ratios=[2.0, 1.45], wspace=0.08)
+    ax = fig.add_subplot(grid[0, 0])
+    ax_table = fig.add_subplot(grid[0, 1])
+
+    ax.barh(plot_df["label"], plot_df["published_top3_prob"], color=bar_colors, alpha=0.92, label="最終Top3確率")
+    ax.scatter(plot_df["win_prob"], plot_df["label"], color="#f28e2b", s=55, zorder=3, label="勝利確率")
+
+    for _, row in plot_df.iterrows():
+        ax.text(
+            float(row["published_top3_prob"]) + 0.006,
+            row["label"],
+            f'{row["published_top3_prob"]:.1%}',
+            va="center",
+            ha="left",
+            fontsize=9,
+            color="#1f2933",
+        )
+
+    subtitle = f"棒=最終Top3確率 / 橙=勝利確率 / 採用モデル={selected_model}"
+    ax.set_xlabel("確率")
+    ax.xaxis.set_major_formatter(PercentFormatter(xmax=1.0, decimals=0))
+    ax.set_xlim(0.0, max(0.32, float(plot_df["published_top3_prob"].max()) + 0.06))
+    ax.grid(axis="x", linestyle="--", linewidth=0.7, alpha=0.35)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(loc="lower right", frameon=False)
+
+    summary_df = ordered.head(8).copy()
+    summary_df["Top3"] = summary_df["published_top3_prob"].map(lambda v: f"{v:.1%}")
+    summary_df["Win"] = summary_df["win_prob"].map(lambda v: f"{v:.1%}")
+    summary_df["Odds"] = summary_df["odds"].map(lambda v: f"{v:.1f}" if pd.notna(v) else "-")
+    summary_df["人気"] = summary_df["popularity"].map(lambda v: f"{int(v)}" if pd.notna(v) else "-")
+    summary_df["馬"] = summary_df["horse_number"].astype(int).astype(str) + " " + summary_df["horse_display_name"].astype(str)
+
+    ax_table.axis("off")
+    table = ax_table.table(
+        cellText=summary_df[["馬", "Top3", "Win", "Odds", "人気"]].values.tolist(),
+        colLabels=["馬", "Top3", "Win", "Odds", "人気"],
+        colColours=["#e9eef5"] * 5,
+        cellLoc="left",
+        colLoc="left",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.0, 1.55)
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_edgecolor("#d9e2ec")
+        if col_idx == 0:
+            cell.set_width(0.52)
+        elif col_idx in {1, 2}:
+            cell.set_width(0.16)
+        else:
+            cell.set_width(0.14)
+        if row_idx == 0:
+            cell.set_text_props(weight="bold", color="#102a43")
+            cell.set_height(cell.get_height() * 1.08)
+            continue
+        is_axis = str(summary_df.iloc[row_idx - 1]["horse_id"]) == axis_horse_key
+        if is_axis:
+            cell.set_facecolor("#fde8ea")
+        elif row_idx % 2 == 0:
+            cell.set_facecolor("#f8fbff")
+        else:
+            cell.set_facecolor("#ffffff")
+        if col_idx == 0 and is_axis:
+            cell.get_text().set_text(f'{summary_df.iloc[row_idx - 1]["馬"]}  <- 軸')
+
+    ax_table.set_title("上位8頭サマリー", loc="left", fontsize=12, fontweight="bold")
+    dashboard_title = f"{race_name} 予測ダッシュボード" if race_name else "予測ダッシュボード"
+    fig.suptitle(dashboard_title, x=0.125, y=0.975, ha="left", fontsize=17, fontweight="bold")
+    fig.text(0.125, 0.935, subtitle, fontsize=10, color="#52606d")
+    fig.subplots_adjust(top=0.88, bottom=0.08, left=0.12, right=0.98)
     filepath = outdir / "top3_probability_bar.png"
-    fig.savefig(filepath, dpi=150)
+    fig.savefig(filepath, dpi=170, bbox_inches="tight")
     plt.close(fig)
     return filepath
 
@@ -326,7 +414,8 @@ def write_prediction_outputs(
     with open(axis_path, "w", encoding="utf-8") as f:
         json.dump(axis_row.to_dict(), f, ensure_ascii=False, indent=2, default=str)
 
-    top3_plot_path = save_top3_bar_chart(pred_df, outdir)
+    race_name = str(config.get("target_race_profile", {}).get("name", ""))
+    top3_plot_path = save_top3_bar_chart(pred_df, outdir, axis_horse_id=str(axis_row["horse_id"]), race_name=race_name)
     calibration_plot_path = save_calibration_plot(eval_result["calibration_curve"], outdir)
     feature_plot_path = save_feature_importance_plot(
         feature_importance_df,
@@ -375,10 +464,28 @@ def run_prediction(
     no_odds_feature_cols = infer_feature_columns(history, entry, use_odds=False)
     sample_weight = compute_similarity_weights(history, config)
 
+    n_unique_races = int(history["race_id"].nunique()) if "race_id" in history.columns else 0
+    n_unique_horses = int(history["horse_id"].nunique()) if "horse_id" in history.columns else 0
+    feature_nan_pct = {
+        col: round(float(history[col].isna().mean()) * 100, 1)
+        for col in feature_cols
+        if history[col].isna().any()
+    }
+    data_diagnostics = {
+        "history_rows": len(history),
+        "entry_rows": len(entry),
+        "unique_races": n_unique_races,
+        "unique_horses": n_unique_horses,
+        "n_features": len(feature_cols),
+        "n_no_odds_features": len(no_odds_feature_cols),
+        "feature_nan_pct": feature_nan_pct,
+    }
+
     eval_result = evaluate_time_series_cv(history, feature_cols, no_odds_feature_cols, sample_weight, config)
     selected_top3_col = select_best_top3_probability_source(eval_result)
     eval_result["summary"]["selected_top3_source"] = selected_top3_col
     eval_result["summary"]["selected_top3_brier_score"] = lookup_top3_brier_score(eval_result["summary"], selected_top3_col)
+    eval_result["summary"]["data_diagnostics"] = data_diagnostics
 
     hybrid_model = fit_hybrid_race_model(
         train_df=history,
