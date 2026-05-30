@@ -8,7 +8,13 @@ from typing import Dict, Tuple
 import pandas as pd
 
 from .data_loader import read_csv_safely
-from .prediction import deep_merge_dicts, load_config, print_prediction_console_summary, run_prediction
+from .prediction import (
+    _compute_selection_reason,
+    deep_merge_dicts,
+    load_config,
+    print_prediction_console_summary,
+    run_prediction,
+)
 
 
 RACE_DATA_COLUMNS = [
@@ -308,9 +314,11 @@ def filter_history_for_prediction(history_df: pd.DataFrame, entry_df: pd.DataFra
         filtered = filtered.loc[~filtered["race_id"].isin(target_race_ids)]
 
     if "race_date" in filtered.columns and "race_date" in entry_df.columns:
-        entry_dates = pd.to_datetime(entry_df["race_date"], errors="coerce").dropna().unique().tolist()
-        if len(entry_dates) == 1:
-            target_date = pd.Timestamp(entry_dates[0])
+        entry_dates = pd.to_datetime(entry_df["race_date"], errors="coerce").dropna()
+        # 日付が複数/欠損でも、解析できた最も早い日付をカットオフにして未来データの
+        # 混入を防ぐ (== 1 のときだけフィルタする旧実装の脆弱性を修正)。
+        if len(entry_dates) >= 1:
+            target_date = pd.Timestamp(entry_dates.min())
             history_dates = pd.to_datetime(filtered["race_date"], errors="coerce")
             filtered = filtered.loc[history_dates.isna() | (history_dates < target_date)]
 
@@ -486,6 +494,7 @@ def build_post_race_report(
     appended_to_training_history: bool,
     race_meta: Dict[str, object] | None = None,
     analysis_df: pd.DataFrame | None = None,
+    output_dir: Path | None = None,
 ) -> Dict[str, object]:
     result_norm = result_df.copy()
     result_norm["horse_id"] = result_norm["horse_id"].astype("string")
@@ -582,7 +591,72 @@ def build_post_race_report(
                 ["abs_rank_error", "abs_mean_rank_error"],
                 ascending=[False, False],
             )[miss_columns].head(5).to_dict(orient="records")
+
+    if "axis_score" in ranked.columns:
+        axis_score_val = float(axis_row.get("axis_score") or float("nan"))
+        axis_score_series = pd.to_numeric(ranked["axis_score"], errors="coerce")
+        axis_rank_in_field = int((axis_score_series > axis_score_val).sum()) + 1
+        axis_tail_risk_val = float(axis_row.get("axis_tail_risk") or float("nan"))
+        report["axis_evaluation"] = {
+            "axis_score": axis_score_val,
+            "axis_rank_in_field": axis_rank_in_field,
+            "axis_tail_risk": axis_tail_risk_val,
+            "hit_top3": bool(str(axis_row["horse_id"]) in actual_top3_ids),
+            "finish_rank": report.get("axis_finish_rank"),
+            "selection_reason": _compute_selection_reason(axis_row),
+        }
+
+    if output_dir is not None:
+        partners_path = Path(output_dir) / "recommended_partners.json"
+        if partners_path.exists():
+            try:
+                import json as _json
+                partners_payload = _json.loads(partners_path.read_text(encoding="utf-8"))
+                partner_ids = {str(p["horse_id"]) for p in partners_payload.get("partners", [])}
+                n_partners = len(partner_ids)
+                covered = len(partner_ids & actual_top3_ids)
+                all_ids = partner_ids | {str(axis_row["horse_id"])}
+                axis_plus_covered = len(all_ids & actual_top3_ids)
+                field_size = len(result_norm)
+                max_possible = min(3, field_size)
+                missed = [
+                    {"horse_id": hid}
+                    for hid in actual_top3_ids
+                    if hid not in partner_ids
+                ]
+                report["partner_evaluation"] = {
+                    "n_partners": n_partners,
+                    "actual_top3_covered": covered,
+                    "cover_rate": float(covered / max_possible) if max_possible > 0 else 0.0,
+                    "missed_horses": missed,
+                    "axis_plus_partners_top3_covered": axis_plus_covered,
+                }
+            except Exception:
+                pass
+
+    report["failure_pattern"] = classify_failure_pattern(report)
+
     return report
+
+
+def classify_failure_pattern(report: Dict[str, object]) -> str:
+    axis_hit = bool(
+        report.get("axis_hit_top3")
+        if report.get("axis_hit_top3") is not None
+        else dict(report.get("axis_evaluation", {}) or {}).get("hit_top3", False)
+    )
+    partner_eval = dict(report.get("partner_evaluation", {}) or {})
+    cover_rate = float(partner_eval.get("cover_rate", 0.0) or 0.0)
+
+    if (not axis_hit) and cover_rate < 0.5:
+        return "both_miss"
+    if not axis_hit:
+        return "axis_miss"
+    if cover_rate < 0.5:
+        return "partner_miss"
+    if cover_rate >= 0.67:
+        return "hit"
+    return "partial_hit"
 
 
 def settle_race(
@@ -627,6 +701,7 @@ def settle_race(
         appended_to_training_history=appended_to_training_history,
         race_meta=result_meta,
         analysis_df=analysis_df,
+        output_dir=output_dir,
     )
     save_json(output_dir / "post_race_report.json", report)
 

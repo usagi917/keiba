@@ -103,3 +103,17 @@ simulation:
 plot:
   calibration_bins: 10
   feature_importance_top_n: 20
+
+partner:
+  n_partners: 5
+  selection_strategy: optimized
+  weights:
+    conditional_top3: 0.4
+    partner_lift: 0.3
+    consensus_top3: 0.3
+  popularity_cap: 3
+  max_popular: 3
+  max_uncertain: 2
+  uncertainty_percentile: 80
+  n_trials: 5000
+  seed_offset: 7000

@@ -12,6 +12,7 @@ from keiba_predictor.features import (
 )
 from keiba_predictor.hybrid_model import (
     _resolve_group_holdout_split,
+    _select_blender_regime,
     fit_probability_blender,
     fit_score_temperature,
     time_series_race_splits,
@@ -51,6 +52,24 @@ class TestTimeSeriesRaceSplits:
         for train_idx, val_idx in splits:
             assert len(train_idx) > 0
             assert len(val_idx) > 0
+
+
+class TestTimeSeriesClampWarning:
+    def test_warns_when_min_train_clamped(self, synthetic_small_history):
+        # 10レースで min_train_races=50 を要求 → 沈黙クランプ → 警告
+        with pytest.warns(UserWarning, match="min_train_races"):
+            time_series_race_splits(
+                synthetic_small_history, n_splits=2, min_train_races=50, warn_on_clamp=True,
+            )
+
+    def test_no_warning_when_not_clamped(self, synthetic_history):
+        import warnings as _w
+
+        with _w.catch_warnings():
+            _w.simplefilter("error")
+            time_series_race_splits(
+                synthetic_history, n_splits=3, min_train_races=5, warn_on_clamp=True,
+            )
 
 
 class TestResolveGroupHoldoutSplit:
@@ -109,3 +128,41 @@ class TestFitProbabilityBlender:
         )
         proba = blender.predict_proba(df)
         assert len(proba) == n
+
+
+class TestSelectBlenderRegime:
+    """データ量別モデル構成の分岐: _select_blender_regime のユニットテスト"""
+
+    def test_small_data_returns_classifier_only(self):
+        cols, use_logistic = _select_blender_regime(n_unique_races=10)
+        assert cols == ["classifier_top3_prob"]
+        assert use_logistic is False
+
+    def test_boundary_49_is_small(self):
+        cols, use_logistic = _select_blender_regime(n_unique_races=49)
+        assert cols == ["classifier_top3_prob"]
+        assert use_logistic is False
+
+    def test_boundary_50_is_medium(self):
+        cols, use_logistic = _select_blender_regime(n_unique_races=50)
+        assert "rank_top3_prob" in cols
+        assert "classifier_top3_prob" in cols
+        assert use_logistic is False
+
+    def test_medium_data_returns_rank_and_classifier(self):
+        cols, use_logistic = _select_blender_regime(n_unique_races=100)
+        assert "rank_top3_prob" in cols
+        assert "classifier_top3_prob" in cols
+        assert use_logistic is False
+
+    def test_boundary_199_is_medium(self):
+        cols, _ = _select_blender_regime(n_unique_races=199)
+        assert "rank_top3_prob" in cols
+
+    def test_boundary_200_is_full(self):
+        cols, use_logistic = _select_blender_regime(n_unique_races=200)
+        assert use_logistic is True
+
+    def test_large_data_uses_logistic_blender(self):
+        cols, use_logistic = _select_blender_regime(n_unique_races=500)
+        assert use_logistic is True

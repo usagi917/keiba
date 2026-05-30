@@ -39,6 +39,11 @@ CANONICAL_ALIASES: Dict[str, List[str]] = {
     "days_since_last": ["dayssincelast", "days_since_last", "休み明け日数", "間隔"],
     "finish_rank": ["finishrank", "finish_rank", "着順"],
     "turn": ["turn", "direction", "course_direction", "turn_direction", "回り", "方向"],
+    "track_condition": ["track_condition", "trackcondition", "馬場状態", "track_state"],
+    "running_style": ["running_style", "脚質", "race_style"],
+    "passing_position": ["passing_position", "通過順"],
+    "last_3f_rank": ["last_3f_rank", "上がり順位"],
+    "track_bias": ["track_bias", "馬場バイアス"],
 }
 
 NUMERIC_HINTS = {
@@ -56,6 +61,7 @@ NUMERIC_HINTS = {
     "last_distance",
     "last_margin",
     "last_3f",
+    "last_3f_rank",
     "days_since_last",
     "finish_rank",
 }
@@ -79,6 +85,7 @@ RAW_FEATURE_CANDIDATES = [
     "last_class",
     "last_margin",
     "last_3f",
+    "last_3f_rank",
     "days_since_last",
     "surface",
     "distance",
@@ -86,6 +93,9 @@ RAW_FEATURE_CANDIDATES = [
     "grade",
     "class",
     "field_size",
+    "running_style",
+    "passing_position",
+    "track_bias",
 ]
 
 

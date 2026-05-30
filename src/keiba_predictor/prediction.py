@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 import json
 from pathlib import Path
 from typing import Dict
@@ -9,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import PercentFormatter
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -21,6 +23,8 @@ try:
         get_feature_importance,
         predict_hybrid_model,
     )
+    from .simulation import compute_tail_risk, conditional_top3_probs
+    from .validation import summarize_edge
 except ImportError:  # pragma: no cover - direct script fallback
     from data_loader import DataValidationError, load_datasets, prepare_datasets
     from features import add_aggregate_features, add_basic_features, add_targets, compute_similarity_weights, infer_feature_columns
@@ -30,6 +34,8 @@ except ImportError:  # pragma: no cover - direct script fallback
         get_feature_importance,
         predict_hybrid_model,
     )
+    from simulation import compute_tail_risk, conditional_top3_probs
+    from validation import summarize_edge
 
 
 DISPLAY_COLS = [
@@ -262,7 +268,87 @@ def save_feature_importance_plot(feature_importance: pd.DataFrame, outdir: Path,
     return filepath
 
 
+def compute_axis_features(pred_df: pd.DataFrame) -> pd.DataFrame:
+    """pred_df に axis_* 特徴量列を追加して返す。
+
+    - axis_top3_prob    : consensus_top3_score のコピー
+    - axis_mean_rank    : mean_rank のコピー
+    - axis_ci_width     : top3_ci_width のコピー
+    - axis_model_std    : component_model_std のコピー
+    - axis_rank_stability: rank_stability_std のコピー
+    - axis_tail_risk    : rank_{k}_prob 列から算出（なければ 0.0）
+    - axis_market_edge  : consensus - implied_prob（odds なしなら 0.0）
+    """
+    df = pred_df.copy()
+    df["axis_top3_prob"] = pd.to_numeric(df.get("consensus_top3_score"), errors="coerce").fillna(0.0)
+    df["axis_mean_rank"] = pd.to_numeric(df.get("mean_rank"), errors="coerce").fillna(float("inf"))
+    df["axis_ci_width"] = pd.to_numeric(df.get("top3_ci_width"), errors="coerce").fillna(1.0)
+    df["axis_model_std"] = pd.to_numeric(df.get("component_model_std"), errors="coerce").fillna(1.0)
+    df["axis_rank_stability"] = pd.to_numeric(df.get("rank_stability_std"), errors="coerce").fillna(1.0)
+    df["axis_tail_risk"] = compute_tail_risk(df, threshold_percentile=50)
+
+    if "odds" in df.columns:
+        odds = pd.to_numeric(df["odds"], errors="coerce")
+        implied = (1.0 / odds.where(odds > 1.0)).fillna(0.0)
+        implied_sum = float(implied.sum())
+        implied_norm = implied / implied_sum if implied_sum > 0.0 else pd.Series(0.0, index=df.index)
+        df["axis_market_edge"] = df["axis_top3_prob"] - implied_norm
+    else:
+        df["axis_market_edge"] = 0.0
+
+    return df
+
+
+def compute_axis_score(axis_features_df: pd.DataFrame) -> pd.Series:
+    """axis_* 特徴量から [0, 1] の axis_score を算出する。
+
+    重み: top3_prob×0.35, (1-tail_risk)×0.25, (1-norm_ci)×0.15,
+          (1-norm_std)×0.15, (1-norm_stability)×0.10
+    """
+    df = axis_features_df
+
+    def _min_max_norm(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce").fillna(0.0)
+        lo, hi = float(s.min()), float(s.max())
+        if hi <= lo:
+            return pd.Series(0.0, index=s.index, dtype=float)
+        return (s - lo) / (hi - lo)
+
+    top3_prob = pd.to_numeric(df.get("axis_top3_prob", 0.0), errors="coerce").fillna(0.0)
+    tail_risk = pd.to_numeric(df.get("axis_tail_risk", 0.0), errors="coerce").fillna(0.0)
+    ci_norm = _min_max_norm(df.get("axis_ci_width", pd.Series(0.0, index=df.index)))
+    std_norm = _min_max_norm(df.get("axis_model_std", pd.Series(0.0, index=df.index)))
+    stab_norm = _min_max_norm(df.get("axis_rank_stability", pd.Series(0.0, index=df.index)))
+
+    raw = (
+        top3_prob * 0.35
+        + (1.0 - tail_risk) * 0.25
+        + (1.0 - ci_norm) * 0.15
+        + (1.0 - std_norm) * 0.15
+        + (1.0 - stab_norm) * 0.10
+    )
+    score = 1.0 / (1.0 + np.exp(-raw))
+    return pd.Series(score.to_numpy(dtype=float), index=df.index, dtype=float)
+
+
+def _compute_selection_reason(axis_row: pd.Series) -> str:
+    """axis_score の上位 2 寄与要因を文字列化する。"""
+    components = {
+        "axis_top3_prob": float(axis_row.get("axis_top3_prob") or 0.0),
+        "axis_tail_risk_inv": 1.0 - float(axis_row.get("axis_tail_risk") or 0.0),
+        "axis_market_edge": float(axis_row.get("axis_market_edge") or 0.0),
+    }
+    top2 = sorted(components.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    return ", ".join(f"{k}={v:.3f}" for k, v in top2)
+
+
 def select_axis_horse(pred_df: pd.DataFrame) -> pd.Series:
+    if "axis_score" in pred_df.columns:
+        return pred_df.sort_values(
+            ["axis_score", "consensus_top3_score"],
+            ascending=[False, False],
+        ).iloc[0]
+    # 従来の 7 基準フォールバック
     sort_cols = [
         "consensus_top3_score",
         "top3_prob",
@@ -272,8 +358,267 @@ def select_axis_horse(pred_df: pd.DataFrame) -> pd.Series:
         "rank_stability_std",
         "classifier_top3_prob",
     ]
-    ascending = [False, False, True, True, True, True, False]
+    ascending = [False, False, True, True, True, False, False]
     return pred_df.sort_values(sort_cols, ascending=ascending).iloc[0]
+
+
+_PARTNER_DEFAULTS: Dict[str, object] = {
+    "n_partners": 5,
+    "selection_strategy": "optimized",
+    "weights": {
+        "conditional_top3": 0.4,
+        "partner_lift": 0.3,
+        "consensus_top3": 0.3,
+    },
+    "popularity_cap": 3,
+    "max_popular": 3,
+    "max_uncertain": 2,
+    "uncertainty_percentile": 80,
+    "n_trials": 5000,
+    "seed_offset": 7000,
+}
+
+
+def _partner_cfg(config: Dict[str, object]) -> Dict[str, object]:
+    """config['partner'] とデフォルト値をマージして返す。"""
+    raw = dict(config.get("partner", {}) or {})
+    merged = dict(_PARTNER_DEFAULTS)
+    merged.update(raw)
+    if "weights" in raw and isinstance(raw["weights"], dict):
+        base_weights = dict(_PARTNER_DEFAULTS["weights"])  # type: ignore[arg-type]
+        base_weights.update(raw["weights"])
+        merged["weights"] = base_weights
+    return merged
+
+
+def _partner_constraints_from_cfg(cfg: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "popularity_cap": int(cfg["popularity_cap"]),
+        "max_popular": int(cfg["max_popular"]),
+        "max_uncertain": int(cfg["max_uncertain"]),
+        "uncertainty_percentile": float(cfg["uncertainty_percentile"]),
+    }
+
+
+def _partner_uncertain_threshold(candidates: pd.DataFrame, constraints: Dict[str, object]) -> float:
+    std_col = pd.to_numeric(
+        candidates.get("component_model_std", pd.Series(0.0, index=candidates.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    if len(std_col) == 0:
+        return float("inf")
+    return float(np.percentile(std_col.to_numpy(dtype=float), float(constraints["uncertainty_percentile"])))
+
+
+def _partner_constraint_ok(
+    candidate_set: pd.DataFrame,
+    constraints: Dict[str, object],
+    uncertain_threshold: float,
+) -> bool:
+    popularity = pd.to_numeric(candidate_set.get("popularity"), errors="coerce")
+    popular_count = int((popularity <= int(constraints["popularity_cap"])).fillna(False).sum())
+    if popular_count > int(constraints["max_popular"]):
+        return False
+
+    std_col = pd.to_numeric(candidate_set.get("component_model_std"), errors="coerce").fillna(0.0)
+    uncertain_count = int((std_col >= uncertain_threshold).sum()) if np.isfinite(uncertain_threshold) else 0
+    if uncertain_count > int(constraints["max_uncertain"]):
+        return False
+
+    return True
+
+
+def optimize_partner_set(
+    candidates_df: pd.DataFrame,
+    axis_horse: str | pd.Series | Dict[str, object],
+    constraints: Dict[str, object],
+    n_partners: int,
+) -> pd.DataFrame:
+    """候補集合を全列挙して、制約を満たす最良の相手集合を返す。"""
+    axis_horse_id = (
+        str(axis_horse.get("horse_id", ""))  # type: ignore[union-attr]
+        if isinstance(axis_horse, (pd.Series, dict))
+        else str(axis_horse)
+    )
+    candidates = candidates_df.copy()
+    if "horse_id" in candidates.columns:
+        candidates = candidates.loc[candidates["horse_id"].astype("string") != axis_horse_id].copy()
+    if len(candidates) <= n_partners:
+        return candidates.sort_values("partner_score_vs_axis", ascending=False).reset_index(drop=True)
+
+    if "partner_score_vs_axis" not in candidates.columns:
+        candidates["partner_score_vs_axis"] = pd.to_numeric(
+            candidates.get("partner_conditional_top3", 0.0),
+            errors="coerce",
+        ).fillna(0.0)
+
+    uncertain_threshold = _partner_uncertain_threshold(candidates, constraints)
+    score_series = pd.to_numeric(candidates.get("partner_conditional_top3"), errors="coerce").fillna(0.0)
+    tiebreak_score = pd.to_numeric(candidates.get("partner_score_vs_axis"), errors="coerce").fillna(0.0)
+    consensus_score = pd.to_numeric(candidates.get("consensus_top3_score"), errors="coerce").fillna(0.0)
+    candidates = candidates.assign(
+        _optimizer_score=score_series,
+        _optimizer_tiebreak=tiebreak_score,
+        _optimizer_consensus=consensus_score,
+    ).reset_index(drop=True)
+
+    best_indices: tuple[int, ...] | None = None
+    best_key: tuple[float, float, float] | None = None
+    for combo in combinations(candidates.index.tolist(), n_partners):
+        subset = candidates.loc[list(combo)]
+        if not _partner_constraint_ok(subset, constraints, uncertain_threshold):
+            continue
+        key = (
+            float(subset["_optimizer_score"].sum()),
+            float(subset["_optimizer_tiebreak"].sum()),
+            float(subset["_optimizer_consensus"].sum()),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_indices = combo
+
+    if best_indices is None:
+        fallback = candidates.sort_values("partner_score_vs_axis", ascending=False).head(n_partners).copy()
+        return fallback.drop(columns=["_optimizer_score", "_optimizer_tiebreak", "_optimizer_consensus"], errors="ignore").reset_index(drop=True)
+
+    selected = candidates.loc[list(best_indices)].sort_values("partner_score_vs_axis", ascending=False).copy()
+    return selected.drop(columns=["_optimizer_score", "_optimizer_tiebreak", "_optimizer_consensus"], errors="ignore").reset_index(drop=True)
+
+
+def _select_partners_greedy(
+    candidates: pd.DataFrame,
+    constraints: Dict[str, object],
+    n_partners: int,
+) -> pd.DataFrame:
+    candidates = candidates.sort_values("partner_score_vs_axis", ascending=False).reset_index(drop=True)
+    uncertain_threshold = _partner_uncertain_threshold(candidates, constraints)
+    selected: list[pd.Series] = []
+    popular_count = 0
+    uncertain_count = 0
+
+    for _, row in candidates.iterrows():
+        if len(selected) >= n_partners:
+            break
+        pop = pd.to_numeric(pd.Series([row.get("popularity")]), errors="coerce").iloc[0]
+        is_popular = pd.notna(pop) and int(pop) <= int(constraints["popularity_cap"])
+        std_val = float(pd.to_numeric(pd.Series([row.get("component_model_std")]), errors="coerce").fillna(0.0).iloc[0])
+        is_uncertain = bool(np.isfinite(uncertain_threshold) and std_val >= uncertain_threshold)
+
+        if is_popular and popular_count >= int(constraints["max_popular"]):
+            continue
+        if is_uncertain and uncertain_count >= int(constraints["max_uncertain"]):
+            continue
+
+        selected.append(row)
+        if is_popular:
+            popular_count += 1
+        if is_uncertain:
+            uncertain_count += 1
+
+    if not selected:
+        return candidates.head(n_partners).reset_index(drop=True)
+    return pd.DataFrame(selected).reset_index(drop=True).head(n_partners)
+
+
+def compute_partner_scores(
+    pred_df: pd.DataFrame,
+    axis_horse_id: str,
+    sim_strengths: np.ndarray,
+    sim_temperature: float,
+    config: Dict[str, object],
+) -> pd.DataFrame:
+    """各馬の条件付き/無条件Top3確率と lift を算出して列追加した DataFrame を返す。
+
+    追加列:
+    - partner_conditional_top3: 軸がTop3のときの条件付きTop3確率（軸自身は NaN）
+    - partner_unconditional_top3: 無条件Top3確率
+    - partner_lift: conditional / unconditional
+    """
+    cfg = _partner_cfg(config)
+    strengths = np.asarray(sim_strengths, dtype=float)
+    n_trials = int(cfg["n_trials"])
+    seed = int(config.get("seed", 42)) + int(cfg["seed_offset"])
+
+    horse_ids = pred_df["horse_id"].astype("string").tolist()
+    try:
+        axis_idx = horse_ids.index(str(axis_horse_id))
+    except ValueError:
+        axis_idx = 0
+
+    cond_probs = conditional_top3_probs(
+        strengths=strengths,
+        axis_idx=axis_idx,
+        temperature=sim_temperature,
+        n_trials=n_trials,
+        seed=seed,
+    )
+
+    df = pred_df.copy()
+    df["partner_conditional_top3"] = cond_probs
+    if "consensus_top3_score" in df.columns:
+        df["partner_unconditional_top3"] = pd.to_numeric(df["consensus_top3_score"], errors="coerce").fillna(0.0).to_numpy()
+    else:
+        df["partner_unconditional_top3"] = np.zeros(len(df))
+
+    unconditional = df["partner_unconditional_top3"].to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lift = np.where(unconditional > 0, cond_probs / unconditional, np.nan)
+    df["partner_lift"] = lift
+
+    # partner_score_vs_axis を事前計算（select_partners でも使用）
+    cfg = _partner_cfg(config)
+    weights = dict(cfg["weights"])  # type: ignore[arg-type]
+    cond_col = pd.to_numeric(df["partner_conditional_top3"], errors="coerce").fillna(0.0)
+    lift_col = pd.to_numeric(df["partner_lift"], errors="coerce").fillna(1.0)
+    consens_col = pd.to_numeric(df.get("consensus_top3_score", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0.0)
+    score = (
+        cond_col * float(weights.get("conditional_top3", 0.4))
+        + lift_col * float(weights.get("partner_lift", 0.3))
+        + consens_col * float(weights.get("consensus_top3", 0.3))
+    )
+    score_arr = score.to_numpy(dtype=float).copy()
+    score_arr[axis_idx] = float("nan")
+    df["partner_score_vs_axis"] = score_arr
+
+    return df
+
+
+def select_partners(
+    pred_df: pd.DataFrame,
+    axis_horse_id: str,
+    config: Dict[str, object],
+    n_partners: int = 5,
+) -> pd.DataFrame:
+    """partner_score_vs_axis 降順で相手馬を選定して返す。
+
+    制約:
+    - 軸馬は除外
+    - popularity <= popularity_cap の馬は max_popular 頭まで
+    - component_model_std の上位 uncertainty_percentile% に入る馬は max_uncertain 頭まで
+    """
+    cfg = _partner_cfg(config)
+    weights = dict(cfg["weights"])  # type: ignore[arg-type]
+    constraints = _partner_constraints_from_cfg(cfg)
+
+    candidates = pred_df.loc[pred_df["horse_id"].astype("string") != str(axis_horse_id)].copy()
+
+    # partner_score_vs_axis を算出（なければ計算）
+    if "partner_score_vs_axis" not in candidates.columns or candidates["partner_score_vs_axis"].isna().all():
+        cond = pd.to_numeric(candidates.get("partner_conditional_top3", 0.0), errors="coerce").fillna(0.0)
+        lift = pd.to_numeric(candidates.get("partner_lift", 1.0), errors="coerce").fillna(1.0)
+        consens = pd.to_numeric(candidates.get("consensus_top3_score", 0.0), errors="coerce").fillna(0.0)
+        candidates["partner_score_vs_axis"] = (
+            cond * float(weights.get("conditional_top3", 0.4))
+            + lift * float(weights.get("partner_lift", 0.3))
+            + consens * float(weights.get("consensus_top3", 0.3))
+        )
+    if len(candidates) <= n_partners:
+        return candidates.sort_values("partner_score_vs_axis", ascending=False).reset_index(drop=True)
+
+    selection_strategy = str(cfg.get("selection_strategy", "optimized")).strip().lower()
+    if selection_strategy == "greedy":
+        return _select_partners_greedy(candidates, constraints=constraints, n_partners=n_partners)
+    return optimize_partner_set(candidates, axis_horse=axis_horse_id, constraints=constraints, n_partners=n_partners)
 
 
 def select_best_top3_probability_source(eval_result: Dict[str, object]) -> str:
@@ -308,6 +653,28 @@ def lookup_top3_brier_score(summary: Dict[str, object], probability_col: str) ->
     return float(score) if score is not None and pd.notna(score) else None
 
 
+def _resolve_sparse_top3_model_selection(
+    pred_df: pd.DataFrame,
+    default_top3_col: str,
+) -> tuple[pd.Series, pd.Series]:
+    selected_model = pd.Series(default_top3_col, index=pred_df.index, dtype="string")
+    consensus = pd.to_numeric(pred_df[default_top3_col], errors="coerce")
+
+    _sparse_raw = pred_df.get("top3_model_sparse_context")
+    if _sparse_raw is None:
+        sparse_context = pd.Series(False, index=pred_df.index)
+    else:
+        sparse_context = pd.to_numeric(_sparse_raw, errors="coerce").fillna(0.0) > 0.0
+    if sparse_context.any():
+        shadow = pd.to_numeric(pred_df["shadow_no_odds_top3_prob"], errors="coerce")
+        regression = pd.to_numeric(pred_df["regression_top3_prob"], errors="coerce")
+        sparse_consensus = (0.6 * shadow) + (0.4 * regression)
+        consensus = consensus.where(~sparse_context, sparse_consensus)
+        selected_model = selected_model.where(~sparse_context, "sparse_shadow_regression_blend")
+
+    return selected_model, consensus
+
+
 def build_prediction_table(
     entry_df: pd.DataFrame,
     component_df: pd.DataFrame,
@@ -325,9 +692,13 @@ def build_prediction_table(
     merged["rank_stability_std"] = merged[
         ["sim_rank", "clf_rank", "aux_clf_rank", "reg_rank", "shadow_no_odds_rank"]
     ].std(axis=1)
-    merged["selected_top3_model"] = selected_top3_col
-    merged["consensus_top3_score"] = pd.to_numeric(merged[selected_top3_col], errors="coerce")
-    merged["calibrated_top3_prob"] = pd.to_numeric(merged[selected_top3_col], errors="coerce")
+    selected_model, consensus = _resolve_sparse_top3_model_selection(merged, selected_top3_col)
+    merged["selected_top3_model"] = selected_model
+    merged["consensus_top3_score"] = consensus
+    merged["calibrated_top3_prob"] = consensus
+
+    merged = compute_axis_features(merged)
+    merged["axis_score"] = compute_axis_score(merged)
 
     ordered_cols = [
         "horse_display_name",
@@ -354,6 +725,13 @@ def build_prediction_table(
         "reg_rank",
         "shadow_no_odds_rank",
         "rank_stability_std",
+        "axis_score",
+        "axis_top3_prob",
+        "axis_tail_risk",
+        "axis_ci_width",
+        "axis_model_std",
+        "axis_rank_stability",
+        "axis_market_edge",
     ]
     remain = [c for c in merged.columns if c not in ordered_cols]
     merged = merged[ordered_cols + remain]
@@ -382,6 +760,46 @@ def validate_prediction_frames(history: pd.DataFrame, entry: pd.DataFrame) -> tu
     return history_out, entry_out
 
 
+def _build_partners_payload(
+    axis_row: pd.Series,
+    partner_rows: pd.DataFrame,
+    config: Dict[str, object],
+) -> Dict[str, object]:
+    axis_payload: Dict[str, object] = {
+        "horse_id": str(axis_row.get("horse_id", "")),
+        "name": str(axis_row.get("horse_display_name", axis_row.get("horse_name", ""))),
+        "axis_score": float(axis_row.get("axis_score") or 0.0),
+    }
+    partners_list = []
+    for rank_idx, (_, pr) in enumerate(partner_rows.iterrows(), start=1):
+        entry: Dict[str, object] = {
+            "horse_id": str(pr.get("horse_id", "")),
+            "name": str(pr.get("horse_display_name", pr.get("horse_name", ""))),
+            "partner_score": float(pr.get("partner_score_vs_axis") or 0.0),
+            "conditional_top3": float(pr.get("partner_conditional_top3") or 0.0)
+            if not pd.isna(pr.get("partner_conditional_top3", float("nan")))
+            else None,
+            "lift": float(pr.get("partner_lift") or 0.0)
+            if not pd.isna(pr.get("partner_lift", float("nan")))
+            else None,
+        }
+        partners_list.append(entry)
+
+    cfg = _partner_cfg(config)
+    return {
+        "axis": axis_payload,
+        "partners": partners_list,
+        "set_confidence": float(
+            np.mean([p["partner_score"] for p in partners_list]) if partners_list else 0.0
+        ),
+        "selection_config": {
+            "n_partners": int(cfg["n_partners"]),
+            "popularity_cap": int(cfg["popularity_cap"]),
+            "max_popular": int(cfg["max_popular"]),
+        },
+    }
+
+
 def write_prediction_outputs(
     outdir: Path,
     pred_df: pd.DataFrame,
@@ -391,6 +809,7 @@ def write_prediction_outputs(
     schema_info: Dict[str, object],
     axis_row: pd.Series,
     config: Dict[str, object],
+    partner_rows: pd.DataFrame | None = None,
 ) -> Dict[str, str]:
     pred_path = outdir / "predictions.csv"
     fold_metric_path = outdir / "cv_fold_metrics.csv"
@@ -414,16 +833,7 @@ def write_prediction_outputs(
     with open(axis_path, "w", encoding="utf-8") as f:
         json.dump(axis_row.to_dict(), f, ensure_ascii=False, indent=2, default=str)
 
-    race_name = str(config.get("target_race_profile", {}).get("name", ""))
-    top3_plot_path = save_top3_bar_chart(pred_df, outdir, axis_horse_id=str(axis_row["horse_id"]), race_name=race_name)
-    calibration_plot_path = save_calibration_plot(eval_result["calibration_curve"], outdir)
-    feature_plot_path = save_feature_importance_plot(
-        feature_importance_df,
-        outdir,
-        top_n=int(config.get("plot", {}).get("feature_importance_top_n", 20)),
-    )
-
-    return {
+    output_paths: Dict[str, str] = {
         "predictions": str(pred_path),
         "cv_fold_metrics": str(fold_metric_path),
         "calibration_curve": str(calibration_path),
@@ -432,10 +842,41 @@ def write_prediction_outputs(
         "schema_report": str(schema_path),
         "evaluation_summary": str(summary_path),
         "recommended_axis_horse": str(axis_path),
-        "top3_bar_chart": str(top3_plot_path),
-        "calibration_plot": str(calibration_plot_path),
-        "feature_importance_plot": str(feature_plot_path),
     }
+
+    if partner_rows is not None and len(partner_rows) > 0:
+        partners_path = outdir / "recommended_partners.json"
+        partners_payload = _build_partners_payload(axis_row, partner_rows, config)
+        with open(partners_path, "w", encoding="utf-8") as f:
+            json.dump(partners_payload, f, ensure_ascii=False, indent=2, default=str)
+        output_paths["recommended_partners"] = str(partners_path)
+
+        axis_id = str(axis_row.get("horse_id", ""))
+        ticket_rows = []
+        for rank_idx, (_, pr) in enumerate(partner_rows.iterrows(), start=1):
+            ticket_rows.append({
+                "axis_horse_id": axis_id,
+                "partner_horse_id": str(pr.get("horse_id", "")),
+                "partner_rank": rank_idx,
+                "partner_score": float(pr.get("partner_score_vs_axis") or 0.0),
+            })
+        ticket_path = outdir / "ticket_candidates.csv"
+        pd.DataFrame(ticket_rows).to_csv(ticket_path, index=False, encoding="utf-8-sig")
+        output_paths["ticket_candidates"] = str(ticket_path)
+
+    race_name = str(config.get("target_race_profile", {}).get("name", ""))
+    top3_plot_path = save_top3_bar_chart(pred_df, outdir, axis_horse_id=str(axis_row["horse_id"]), race_name=race_name)
+    calibration_plot_path = save_calibration_plot(eval_result["calibration_curve"], outdir)
+    feature_plot_path = save_feature_importance_plot(
+        feature_importance_df,
+        outdir,
+        top_n=int(config.get("plot", {}).get("feature_importance_top_n", 20)),
+    )
+    output_paths["top3_bar_chart"] = str(top3_plot_path)
+    output_paths["calibration_plot"] = str(calibration_plot_path)
+    output_paths["feature_importance_plot"] = str(feature_plot_path)
+
+    return output_paths
 
 
 def run_prediction(
@@ -480,12 +921,22 @@ def run_prediction(
         "n_no_odds_features": len(no_odds_feature_cols),
         "feature_nan_pct": feature_nan_pct,
     }
+    sparse_entry_count = int(pd.to_numeric(entry.get("top3_model_sparse_context"), errors="coerce").fillna(0.0).sum())
+    sparse_entry_ratio = float(sparse_entry_count / len(entry)) if len(entry) > 0 else 0.0
 
     eval_result = evaluate_time_series_cv(history, feature_cols, no_odds_feature_cols, sample_weight, config)
     selected_top3_col = select_best_top3_probability_source(eval_result)
     eval_result["summary"]["selected_top3_source"] = selected_top3_col
     eval_result["summary"]["selected_top3_brier_score"] = lookup_top3_brier_score(eval_result["summary"], selected_top3_col)
+    eval_result["summary"]["sparse_entry_count"] = sparse_entry_count
+    eval_result["summary"]["sparse_entry_ratio"] = sparse_entry_ratio
+    data_diagnostics["sparse_entry_count"] = sparse_entry_count
+    data_diagnostics["sparse_entry_ratio"] = sparse_entry_ratio
     eval_result["summary"]["data_diagnostics"] = data_diagnostics
+
+    # 検証基盤: データ十分性(低信頼フラグ)とモデル vs 市場(人気馬/シャドウ)の上乗せを surface する。
+    eval_result["summary"]["data_sufficiency"] = eval_result.get("data_sufficiency", {})
+    eval_result["summary"]["edge_vs_market"] = summarize_edge(eval_result["oof_predictions"])
 
     hybrid_model = fit_hybrid_race_model(
         train_df=history,
@@ -505,6 +956,27 @@ def run_prediction(
     axis_row = select_axis_horse(pred_df)
     feature_importance_df = get_feature_importance(hybrid_model)
 
+    # Phase 2: Partner スコア算出
+    # pred_df は consensus_top3_score で並び替え済みのため、strengths も pred_df の順で取得して axis_idx と整合させる。
+    if "rank_strength" in pred_df.columns:
+        sim_strengths = pd.to_numeric(pred_df["rank_strength"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    else:
+        sim_strengths = np.zeros(len(pred_df))
+    if "rank_temperature" in pred_df.columns:
+        sim_temperature = float(pd.to_numeric(pred_df["rank_temperature"], errors="coerce").iloc[0])
+    else:
+        sim_temperature = 1.0
+    pred_df = compute_partner_scores(
+        pred_df=pred_df,
+        axis_horse_id=str(axis_row["horse_id"]),
+        sim_strengths=sim_strengths,
+        sim_temperature=sim_temperature,
+        config=config,
+    )
+    cfg = _partner_cfg(config)
+    n_partners = int(cfg["n_partners"])
+    partner_rows = select_partners(pred_df, axis_horse_id=str(axis_row["horse_id"]), config=config, n_partners=n_partners)
+
     output_paths = write_prediction_outputs(
         outdir=outdir,
         pred_df=pred_df,
@@ -514,6 +986,7 @@ def run_prediction(
         schema_info=schema_info,
         axis_row=axis_row,
         config=config,
+        partner_rows=partner_rows,
     )
 
     return {
@@ -521,6 +994,7 @@ def run_prediction(
         "eval_result": eval_result,
         "predictions": pred_df,
         "axis_row": axis_row,
+        "partner_rows": partner_rows,
         "schema_info": schema_info,
         "feature_importance": feature_importance_df,
         "simulation_diagnostics": sim_diag_df,
@@ -534,14 +1008,40 @@ def print_prediction_console_summary(result: Dict[str, object]) -> None:
     eval_result = result["eval_result"]
     output_paths = result["output_paths"]
 
+    display_cols = [c for c in DISPLAY_COLS if c in pred_df.columns]
+    axis_display_cols = [c for c in DISPLAY_COLS if c in axis_row.index]
+
+    summary = eval_result.get("summary", {}) if isinstance(eval_result, dict) else {}
+    sufficiency = summary.get("data_sufficiency", {}) or {}
+    if sufficiency.get("is_low_confidence"):
+        print("=" * 72)
+        print(
+            f"[⚠ 低信頼] レース数={sufficiency.get('n_races')} / regime={sufficiency.get('regime')}。"
+            "検証が統計的に不十分です。以下の予測は参考値です。"
+        )
+        for warn_msg in sufficiency.get("warnings", []):
+            print(f"  - {warn_msg}")
+        print("=" * 72)
+    edge = summary.get("edge_vs_market", {}) or {}
+    if edge:
+        print("\n[INFO] モデル vs 市場 (軸Top3的中率 / 上乗せ)")
+        print(json.dumps(edge, ensure_ascii=False, indent=2))
+
     print("[INFO] feature columns")
     print(result["feature_cols"])
     print("\n[INFO] CV summary")
     print(json.dumps(eval_result["summary"], ensure_ascii=False, indent=2))
     print("\n[INFO] prediction table")
-    print(pred_df[DISPLAY_COLS].to_string(index=False))
+    print(pred_df[display_cols].to_string(index=False))
     print("\n[INFO] recommended axis horse")
-    print(axis_row[DISPLAY_COLS].to_string())
+    print(axis_row[axis_display_cols].to_string())
+
+    partner_rows = result.get("partner_rows")
+    if partner_rows is not None and len(partner_rows) > 0:
+        print("\n[INFO] recommended partner horses (相手候補)")
+        partner_cols = [c for c in ["horse_display_name", "partner_score_vs_axis", "partner_conditional_top3", "partner_lift", "consensus_top3_score"] if c in partner_rows.columns]
+        print(partner_rows[partner_cols].to_string(index=False))
+
     print("\n[INFO] outputs")
     for key, path in output_paths.items():
         print(f"{key}={path}")
