@@ -455,6 +455,22 @@ def _sort_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
     return ranked.sort_values(["consensus_top3_score", "top3_ci_width"], ascending=[False, True]).reset_index(drop=True)
 
 
+def _select_report_axis_row(ranked_predictions_df: pd.DataFrame) -> pd.Series:
+    if "axis_score" not in ranked_predictions_df.columns:
+        return ranked_predictions_df.iloc[0]
+
+    axis_score = pd.to_numeric(ranked_predictions_df["axis_score"], errors="coerce")
+    if axis_score.notna().any():
+        ranked = ranked_predictions_df.assign(_axis_score_numeric=axis_score)
+        selected = ranked.sort_values(
+            ["_axis_score_numeric", "consensus_top3_score"],
+            ascending=[False, False],
+        ).iloc[0]
+        return selected.drop(labels=["_axis_score_numeric"])
+
+    return ranked_predictions_df.iloc[0]
+
+
 def build_post_race_analysis(
     predictions_df: pd.DataFrame | None,
     result_df: pd.DataFrame,
@@ -520,7 +536,7 @@ def build_post_race_report(
     predicted_top3 = ranked.head(3)
     predicted_top3_ids = set(predicted_top3["horse_id"].astype("string"))
     actual_top3_ids = set(result_norm[result_norm["finish_rank"] <= 3]["horse_id"].astype("string"))
-    axis_row = ranked.iloc[0]
+    axis_row = _select_report_axis_row(ranked)
     winner_row = result_norm.sort_values("finish_rank").iloc[0]
     if "selected_top3_model" in ranked.columns and ranked["selected_top3_model"].notna().any():
         report["selected_top3_model"] = str(ranked["selected_top3_model"].dropna().iloc[0])
@@ -533,6 +549,8 @@ def build_post_race_report(
         "horse_display_name": str(axis_row["horse_display_name"]),
         "consensus_top3_score": float(axis_row["consensus_top3_score"]),
     }
+    if "axis_score" in axis_row.index and pd.notna(axis_row["axis_score"]):
+        report["predicted_axis_horse"]["axis_score"] = float(axis_row["axis_score"])
     actual_winner: Dict[str, object] = {}
     for key in [col for col in ["horse_id", "horse_name", "finish_rank", "result_time", "result_time_seconds"] if col in winner_row.index]:
         value = winner_row[key]

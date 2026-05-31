@@ -250,7 +250,7 @@ class TestAxisEvaluation:
         settled_df = build_settled_entry(entry_df, result_df)
 
         predictions_df = _sample_predictions_df().copy()
-        predictions_df["axis_score"] = [0.75, 0.60, 0.45]
+        predictions_df["axis_score"] = [0.60, 0.75, 0.45]
         predictions_df["axis_tail_risk"] = [0.15, 0.25, 0.35]
 
         analysis_df = build_post_race_analysis(predictions_df=predictions_df, result_df=result_df)
@@ -271,6 +271,9 @@ class TestAxisEvaluation:
         assert isinstance(ae["axis_rank_in_field"], int)
         assert isinstance(ae["hit_top3"], bool)
         assert isinstance(ae["selection_reason"], str)
+        assert report["predicted_axis_horse"]["horse_id"] == "H001"
+        assert report["predicted_axis_horse"]["axis_score"] == pytest.approx(0.75)
+        assert report["axis_finish_rank"] == 1
 
     def test_build_post_race_report_no_axis_evaluation_without_axis_score(self) -> None:
         """predictions_df に axis_score 列がないとき axis_evaluation は含まれない。"""
