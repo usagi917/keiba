@@ -6,6 +6,79 @@ import numpy as np
 import pandas as pd
 
 
+def compute_tail_risk(rank_distribution_df: pd.DataFrame, threshold_percentile: float = 50) -> np.ndarray:
+    """各馬の「下位 threshold_percentile% に入る確率」(tail risk) を返す。
+
+    rank_distribution_df は `plackett_luce_rank_distribution` の戻り値相当で
+    `rank_{k}_prob` 列を持つ。
+
+    例: n=18, threshold_percentile=50 → rank_10〜rank_18 の確率合計。
+    """
+    n = len(rank_distribution_df)
+    # bottom threshold_percentile% の先頭順位
+    threshold_rank = int(n * threshold_percentile / 100) + 1
+    tail_cols = [
+        f"rank_{k}_prob"
+        for k in range(threshold_rank, n + 1)
+        if f"rank_{k}_prob" in rank_distribution_df.columns
+    ]
+    if not tail_cols:
+        return np.zeros(n, dtype=float)
+    return rank_distribution_df[tail_cols].sum(axis=1).to_numpy(dtype=float)
+
+
+def conditional_top3_probs(
+    strengths: np.ndarray,
+    axis_idx: int,
+    temperature: float,
+    n_trials: int,
+    seed: int,
+    min_valid_trials: int = 100,
+    block_size: int = 20_000,
+) -> np.ndarray:
+    """軸馬（axis_idx）がTop3に入ったときに各馬もTop3に入る条件付き確率を返す。
+
+    軸馬自身の値は NaN。有効試行数が min_valid_trials 未満なら n_trials を倍増して再試行。
+    """
+    strength_arr = np.asarray(strengths, dtype=float)
+    temp = max(float(temperature), 1e-6)
+    n_horses = len(strength_arr)
+    rng = np.random.default_rng(seed)
+
+    current_n = int(max(n_trials, 1))
+    for _ in range(4):  # 最大 4 回試行
+        sampled = np.empty((0, n_horses), dtype=np.int32)
+        remaining = current_n
+        while remaining > 0:
+            batch = min(block_size, remaining)
+            scores = rng.gumbel(
+                loc=strength_arr.reshape(1, -1),
+                scale=temp,
+                size=(batch, n_horses),
+            )
+            order = np.argsort(-scores, axis=1)
+            ranks = np.empty_like(order)
+            ranks[np.arange(batch)[:, None], order] = np.arange(1, n_horses + 1)
+            sampled = np.vstack([sampled, ranks]) if len(sampled) > 0 else ranks
+            remaining -= batch
+
+        axis_in_top3 = sampled[:, axis_idx] <= 3
+        valid_trials = int(axis_in_top3.sum())
+        if valid_trials >= min_valid_trials:
+            break
+        current_n *= 2
+
+    if valid_trials == 0:
+        out = np.full(n_horses, np.nan, dtype=float)
+        return out
+
+    filtered = sampled[axis_in_top3]
+    top3_counts = (filtered <= 3).sum(axis=0).astype(float)
+    out = top3_counts / valid_trials
+    out[axis_idx] = np.nan
+    return out
+
+
 def wilson_interval(successes: np.ndarray, n: int, z: float = 1.96) -> Tuple[np.ndarray, np.ndarray]:
     p = successes / max(n, 1)
     denom = 1.0 + (z ** 2) / n

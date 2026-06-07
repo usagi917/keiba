@@ -1,6 +1,6 @@
 [project]
 name = "keiba-axis-model"
-version = "0.1.0"
+version = "0.2.0"
 description = "Horse racing axis horse prediction with time-series ensemble models"
 requires-python = ">=3.10"
 dependencies = [
@@ -22,4 +22,4 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

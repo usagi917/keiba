@@ -33,7 +33,24 @@ CATEGORICAL_HINTS = {
     "turn",
     "direction",
     "course_direction",
+    "rest_bucket",
+    "track_condition",
+    "running_style",
+    "passing_position",
+    "track_bias",
 }
+
+_ODDS_RELATED_NUMERIC = frozenset({
+    "odds",
+    "popularity",
+    "log_odds",
+    "implied_prob",
+    "popularity_inv",
+    "odds_rank_score",
+    "popularity_rank_score",
+    "implied_prob_share",
+    "log_odds_field_delta",
+})
 
 
 class IdentityCalibrator:
@@ -148,11 +165,19 @@ def infer_column_types(df: pd.DataFrame, feature_cols: Sequence[str]) -> Tuple[L
     return numeric_cols, categorical_cols
 
 
+def filter_observed_feature_columns(df: pd.DataFrame, feature_cols: Sequence[str]) -> List[str]:
+    return [col for col in feature_cols if col in df.columns and df[col].notna().any()]
+
+
 def build_preprocessor(df: pd.DataFrame, feature_cols: Sequence[str]) -> ColumnTransformer:
-    numeric_cols, categorical_cols = infer_column_types(df, feature_cols)
+    observed_feature_cols = filter_observed_feature_columns(df, feature_cols)
+    numeric_cols, categorical_cols = infer_column_types(df, observed_feature_cols)
+
+    odds_numeric = [c for c in numeric_cols if c in _ODDS_RELATED_NUMERIC]
+    other_numeric = [c for c in numeric_cols if c not in _ODDS_RELATED_NUMERIC]
 
     transformers = []
-    if numeric_cols:
+    if other_numeric:
         transformers.append(
             (
                 "num",
@@ -162,7 +187,20 @@ def build_preprocessor(df: pd.DataFrame, feature_cols: Sequence[str]) -> ColumnT
                         ("scaler", StandardScaler()),
                     ]
                 ),
-                numeric_cols,
+                other_numeric,
+            )
+        )
+    if odds_numeric:
+        transformers.append(
+            (
+                "odds_num",
+                Pipeline(
+                    steps=[
+                        ("imputer", SimpleImputer(strategy="mean")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                odds_numeric,
             )
         )
     if categorical_cols:
@@ -180,7 +218,7 @@ def build_preprocessor(df: pd.DataFrame, feature_cols: Sequence[str]) -> ColumnT
         )
 
     if not transformers:
-        raise ValueError("前処理対象の特徴量がありません。")
+        raise ValueError("前処理対象の特徴量がありません。学習データで観測値を持つ列が必要です。")
 
     return ColumnTransformer(transformers=transformers, remainder="drop")
 

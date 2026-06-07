@@ -6,11 +6,12 @@ __pycache__/
 
 # Generated outputs
 outputs/
+baselines.json
 
-# Race data (scraped from Sports Navi)
-races/**/*.csv
-data/training/
+# Local race and training data
+data/
 races/
+
 # Claude Code
 .claude/
 
@@ -19,4 +20,6 @@ races/
 
 # Plans
 plans/
-tests/
+
+# External reference checkout (not part of this project)
+amplifier/

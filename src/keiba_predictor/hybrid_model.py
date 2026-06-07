@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -41,6 +42,11 @@ except ImportError:  # pragma: no cover - direct script fallback
         plackett_luce_group_topk_probabilities,
     )
 
+try:
+    from .validation import assess_data_sufficiency, resolve_cv_plan
+except ImportError:  # pragma: no cover - direct script fallback
+    from validation import assess_data_sufficiency, resolve_cv_plan
+
 
 EPSILON = 1e-6
 CATEGORICAL_HINTS = {
@@ -55,8 +61,33 @@ CATEGORICAL_HINTS = {
     "turn",
     "direction",
     "course_direction",
+    "rest_bucket",
+    "track_condition",
+    "running_style",
+    "passing_position",
+    "track_bias",
 }
 DEFAULT_TEMPERATURE_GRID = [0.35, 0.5, 0.65, 0.8, 1.0, 1.2, 1.5, 1.8, 2.2]
+
+
+def _select_blender_regime(n_unique_races: int) -> tuple[list[str], bool]:
+    """データ量に応じたブレンダー構成を返す。
+
+    Returns:
+        (feature_cols, use_logistic) のタプル。
+        use_logistic=False の場合は simple average モード (blender.model=None)。
+    """
+    if n_unique_races < 50:
+        return ["classifier_top3_prob"], False
+    if n_unique_races < 200:
+        return ["rank_top3_prob", "classifier_top3_prob"], False
+    return [
+        "rank_top3_prob",
+        "classifier_top3_prob",
+        "shadow_no_odds_top3_prob",
+        "regression_top3_prob",
+        "aux_classifier_top3_prob",
+    ], True
 
 
 @dataclass
@@ -174,6 +205,7 @@ def time_series_race_splits(
     df: pd.DataFrame,
     n_splits: int,
     min_train_races: int,
+    warn_on_clamp: bool = False,
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     races = (
         df[["race_id", "race_date"]]
@@ -184,6 +216,23 @@ def time_series_race_splits(
     n_races = len(races)
     if n_races < 3:
         raise ValueError(f"時系列CVに必要なレース数が不足しています。n_races={n_races}")
+
+    if warn_on_clamp:
+        plan = resolve_cv_plan(n_races, n_splits, min_train_races)
+        if plan.min_train_races_clamped:
+            warnings.warn(
+                f"min_train_races={int(min_train_races)} は実効 {plan.effective_min_train_races} に"
+                f"沈黙クランプされました (n_races={n_races})。設定上の下限は強制されていません。",
+                UserWarning,
+                stacklevel=2,
+            )
+        if plan.n_splits_clamped:
+            warnings.warn(
+                f"n_splits={int(n_splits)} は実効 {plan.effective_n_splits} にクランプされました "
+                f"(n_races={n_races})。",
+                UserWarning,
+                stacklevel=2,
+            )
 
     n_splits = max(1, min(int(n_splits), n_races - 1))
     min_train_races = max(1, min(int(min_train_races), n_races - n_splits))
@@ -778,6 +827,15 @@ def fit_hybrid_race_model(
             config=config,
         )
 
+    n_unique_races = train_df["race_id"].nunique()
+    regime_cols, use_logistic = _select_blender_regime(n_unique_races)
+    if not use_logistic:
+        blender = ProbabilityBlender(
+            feature_cols=regime_cols,
+            model=None,
+            weights=None,
+        )
+
     return HybridRaceModel(
         rank_model=rank_model,
         classifier_model=classifier_model,
@@ -987,6 +1045,9 @@ def evaluate_time_series_cv(
     config: Dict[str, object],
 ) -> Dict[str, object]:
     cv_cfg = config.get("cv", {})
+    data_sufficiency = assess_data_sufficiency(history_df, config)
+    for message in data_sufficiency["warnings"]:
+        warnings.warn(message, UserWarning, stacklevel=2)
     splits = time_series_race_splits(
         history_df,
         n_splits=int(cv_cfg.get("n_splits", 4)),
@@ -1107,6 +1168,7 @@ def evaluate_time_series_cv(
         "oof_predictions": oof_df,
         "summary": summary,
         "calibration_curve": calibration_df,
+        "data_sufficiency": data_sufficiency,
     }
 
 

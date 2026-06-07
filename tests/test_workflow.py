@@ -8,8 +8,48 @@ from keiba_predictor.workflow import (
     build_post_race_analysis,
     build_post_race_report,
     build_settled_entry,
+    classify_failure_pattern,
+    filter_history_for_prediction,
     validate_result_frame,
 )
+
+
+class TestFilterHistoryForPrediction:
+    def _history(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "race_id": ["H1", "H2", "H3"],
+                "race_date": pd.to_datetime(["2026-01-01", "2026-06-01", "2026-12-01"]),
+                "horse_id": ["a", "b", "c"],
+            }
+        )
+
+    def test_excludes_future_history_with_single_entry_date(self):
+        entry = pd.DataFrame(
+            {"race_id": ["E1"], "race_date": pd.to_datetime(["2026-05-01"]), "horse_id": ["x"]}
+        )
+        filtered = filter_history_for_prediction(self._history(), entry)
+        assert set(filtered["race_id"]) == {"H1"}
+
+    def test_excludes_future_history_with_multiple_entry_dates(self):
+        # entry 日付が複数でも、最も早い日付をカットオフに未来データを除外する
+        entry = pd.DataFrame(
+            {
+                "race_id": ["E1", "E1"],
+                "race_date": pd.to_datetime(["2026-05-01", "2026-05-02"]),
+                "horse_id": ["x", "y"],
+            }
+        )
+        filtered = filter_history_for_prediction(self._history(), entry)
+        assert set(filtered["race_id"]) == {"H1"}
+
+    def test_keeps_history_with_unparseable_dates(self):
+        entry = pd.DataFrame(
+            {"race_id": ["E1"], "race_date": [pd.NaT], "horse_id": ["x"]}
+        )
+        # 日付が解析不能なら race_id フィルタのみ(クラッシュしない)
+        filtered = filter_history_for_prediction(self._history(), entry)
+        assert set(filtered["race_id"]) == {"H1", "H2", "H3"}
 
 
 def _sample_entry_df() -> pd.DataFrame:
@@ -137,6 +177,26 @@ class TestValidateResultFrame:
         assert normalized["result_final_popularity"].tolist() == [1, 15, 7]
         assert normalized["result_body_weight_diff"].tolist() == [-2, -18, 3]
 
+    def test_accepts_dead_heat_competition_ranking(self):
+        entry_df = _sample_entry_df()
+        result_df = _sample_result_df()
+        result_df.loc[result_df["horse_id"].isin(["H002", "H003"]), "finish_rank"] = 2
+        result_df.loc[result_df["horse_id"] == "H003", "result_margin"] = "同着"
+
+        normalized, is_full_result = validate_result_frame(entry_df, result_df)
+
+        assert is_full_result is True
+        assert normalized["horse_id"].tolist() == ["H001", "H002", "H003"]
+        assert normalized["finish_rank"].tolist() == [1, 2, 2]
+
+    def test_rejects_skipped_rank_without_dead_heat(self):
+        entry_df = _sample_entry_df()
+        result_df = _sample_result_df()
+        result_df.loc[result_df["horse_id"] == "H003", "finish_rank"] = 4
+
+        with pytest.raises(SystemExit, match="公式順位形式"):
+            validate_result_frame(entry_df, result_df)
+
 
 class TestBuildSettledEntry:
     def test_preserves_optional_result_columns(self):
@@ -202,6 +262,123 @@ class TestPostRaceAnalysis:
         assert report["largest_prediction_gaps"][0]["published_top3_prob"] == pytest.approx(0.8)
 
 
+class TestAxisEvaluation:
+    def test_build_post_race_report_has_axis_evaluation(self) -> None:
+        """predictions_df に axis_score 列がある場合、axis_evaluation がレポートに含まれる。"""
+        entry_df = _sample_entry_df()
+        result_df, _ = validate_result_frame(entry_df, _sample_result_df())
+        settled_df = build_settled_entry(entry_df, result_df)
+
+        predictions_df = _sample_predictions_df().copy()
+        predictions_df["axis_score"] = [0.60, 0.75, 0.45]
+        predictions_df["axis_tail_risk"] = [0.15, 0.25, 0.35]
+
+        analysis_df = build_post_race_analysis(predictions_df=predictions_df, result_df=result_df)
+        report = build_post_race_report(
+            predictions_df=predictions_df,
+            settled_entry_df=settled_df,
+            result_df=result_df,
+            is_full_result=True,
+            appended_to_training_history=False,
+            analysis_df=analysis_df,
+        )
+
+        assert "axis_evaluation" in report
+        ae = report["axis_evaluation"]
+        for key in ["axis_score", "axis_rank_in_field", "axis_tail_risk", "hit_top3", "finish_rank", "selection_reason"]:
+            assert key in ae, f"axis_evaluation に {key} がない"
+        assert isinstance(ae["axis_score"], float)
+        assert isinstance(ae["axis_rank_in_field"], int)
+        assert isinstance(ae["hit_top3"], bool)
+        assert isinstance(ae["selection_reason"], str)
+        assert report["predicted_axis_horse"]["horse_id"] == "H001"
+        assert report["predicted_axis_horse"]["axis_score"] == pytest.approx(0.75)
+        assert report["axis_finish_rank"] == 1
+
+    def test_build_post_race_report_no_axis_evaluation_without_axis_score(self) -> None:
+        """predictions_df に axis_score 列がないとき axis_evaluation は含まれない。"""
+        entry_df = _sample_entry_df()
+        result_df, _ = validate_result_frame(entry_df, _sample_result_df())
+        settled_df = build_settled_entry(entry_df, result_df)
+
+        predictions_df = _sample_predictions_df()  # axis_score なし
+        report = build_post_race_report(
+            predictions_df=predictions_df,
+            settled_entry_df=settled_df,
+            result_df=result_df,
+            is_full_result=True,
+            appended_to_training_history=False,
+        )
+        assert "axis_evaluation" not in report
+
+
+class TestPartnerEvaluation:
+    """2-6: build_post_race_report に partner_evaluation が含まれる。"""
+
+    def _sample_predictions_with_partners(self) -> pd.DataFrame:
+        pred_df = _sample_predictions_df().copy()
+        pred_df["axis_score"] = [0.75, 0.60, 0.45]
+        pred_df["axis_tail_risk"] = [0.15, 0.25, 0.35]
+        pred_df["partner_score_vs_axis"] = [float("nan"), 0.65, 0.50]
+        return pred_df
+
+    def test_partner_evaluation_present_when_partners_json_provided(self, tmp_path) -> None:
+        """recommended_partners.json が output_dir にあるとき partner_evaluation が含まれる。"""
+        import json, pathlib
+
+        entry_df = _sample_entry_df()
+        result_df, _ = validate_result_frame(entry_df, _sample_result_df())
+        settled_df = build_settled_entry(entry_df, result_df)
+        predictions_df = self._sample_predictions_with_partners()
+        analysis_df = build_post_race_analysis(predictions_df=predictions_df, result_df=result_df)
+
+        partners_payload = {
+            "axis": {"horse_id": "H002", "name": "Beta", "axis_score": 0.75},
+            "partners": [
+                {"horse_id": "H001", "name": "Alpha", "partner_score": 0.65},
+                {"horse_id": "H003", "name": "Gamma", "partner_score": 0.50},
+            ],
+        }
+        partners_path = tmp_path / "recommended_partners.json"
+        partners_path.write_text(json.dumps(partners_payload), encoding="utf-8")
+
+        report = build_post_race_report(
+            predictions_df=predictions_df,
+            settled_entry_df=settled_df,
+            result_df=result_df,
+            is_full_result=True,
+            appended_to_training_history=False,
+            analysis_df=analysis_df,
+            output_dir=tmp_path,
+        )
+
+        assert "partner_evaluation" in report
+        pe = report["partner_evaluation"]
+        for key in ["n_partners", "actual_top3_covered", "cover_rate", "missed_horses", "axis_plus_partners_top3_covered"]:
+            assert key in pe, f"partner_evaluation に {key} がない"
+        assert isinstance(pe["n_partners"], int)
+        assert isinstance(pe["cover_rate"], float)
+        assert isinstance(pe["missed_horses"], list)
+
+    def test_partner_evaluation_absent_without_output_dir(self) -> None:
+        """output_dir が渡されないとき partner_evaluation は含まれない。"""
+        entry_df = _sample_entry_df()
+        result_df, _ = validate_result_frame(entry_df, _sample_result_df())
+        settled_df = build_settled_entry(entry_df, result_df)
+        predictions_df = self._sample_predictions_with_partners()
+        analysis_df = build_post_race_analysis(predictions_df=predictions_df, result_df=result_df)
+
+        report = build_post_race_report(
+            predictions_df=predictions_df,
+            settled_entry_df=settled_df,
+            result_df=result_df,
+            is_full_result=True,
+            appended_to_training_history=False,
+            analysis_df=analysis_df,
+        )
+        assert "partner_evaluation" not in report
+
+
 class TestPredictionDashboardOrdering:
     def test_dashboard_uses_published_top3_score(self):
         pred_df = pd.DataFrame(
@@ -216,3 +393,25 @@ class TestPredictionDashboardOrdering:
 
         assert ordered["horse_id"].tolist() == ["H002", "H003", "H001"]
         assert ordered["published_top3_prob"].tolist() == pytest.approx([0.9, 0.8, 0.6])
+
+
+class TestClassifyFailurePattern:
+    def test_classifies_both_miss(self) -> None:
+        report = {"axis_hit_top3": False, "partner_evaluation": {"cover_rate": 0.0}}
+        assert classify_failure_pattern(report) == "both_miss"
+
+    def test_classifies_axis_miss(self) -> None:
+        report = {"axis_hit_top3": False, "partner_evaluation": {"cover_rate": 0.67}}
+        assert classify_failure_pattern(report) == "axis_miss"
+
+    def test_classifies_partner_miss(self) -> None:
+        report = {"axis_hit_top3": True, "partner_evaluation": {"cover_rate": 0.33}}
+        assert classify_failure_pattern(report) == "partner_miss"
+
+    def test_classifies_hit(self) -> None:
+        report = {"axis_hit_top3": True, "partner_evaluation": {"cover_rate": 0.67}}
+        assert classify_failure_pattern(report) == "hit"
+
+    def test_classifies_partial_hit(self) -> None:
+        report = {"axis_hit_top3": True, "partner_evaluation": {"cover_rate": 0.5}}
+        assert classify_failure_pattern(report) == "partial_hit"

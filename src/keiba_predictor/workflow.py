@@ -8,7 +8,13 @@ from typing import Dict, Tuple
 import pandas as pd
 
 from .data_loader import read_csv_safely
-from .prediction import deep_merge_dicts, load_config, print_prediction_console_summary, run_prediction
+from .prediction import (
+    _compute_selection_reason,
+    deep_merge_dicts,
+    load_config,
+    print_prediction_console_summary,
+    run_prediction,
+)
 
 
 RACE_DATA_COLUMNS = [
@@ -308,9 +314,11 @@ def filter_history_for_prediction(history_df: pd.DataFrame, entry_df: pd.DataFra
         filtered = filtered.loc[~filtered["race_id"].isin(target_race_ids)]
 
     if "race_date" in filtered.columns and "race_date" in entry_df.columns:
-        entry_dates = pd.to_datetime(entry_df["race_date"], errors="coerce").dropna().unique().tolist()
-        if len(entry_dates) == 1:
-            target_date = pd.Timestamp(entry_dates[0])
+        entry_dates = pd.to_datetime(entry_df["race_date"], errors="coerce").dropna()
+        # 日付が複数/欠損でも、解析できた最も早い日付をカットオフにして未来データの
+        # 混入を防ぐ (== 1 のときだけフィルタする旧実装の脆弱性を修正)。
+        if len(entry_dates) >= 1:
+            target_date = pd.Timestamp(entry_dates.min())
             history_dates = pd.to_datetime(filtered["race_date"], errors="coerce")
             filtered = filtered.loc[history_dates.isna() | (history_dates < target_date)]
 
@@ -361,8 +369,32 @@ def predict_race(
     return result
 
 
+def _is_valid_competition_ranking(ranks: list[int]) -> bool:
+    """Validate official competition ranking, including dead heats.
+
+    Examples: [1, 2, 3], [1, 2, 2, 4], and [1, 1, 3] are valid.
+    """
+    if not ranks:
+        return False
+
+    expected_rank = 1
+    index = 0
+    sorted_ranks = sorted(ranks)
+    while index < len(sorted_ranks):
+        rank = sorted_ranks[index]
+        if rank != expected_rank:
+            return False
+        tied_count = 0
+        while index + tied_count < len(sorted_ranks) and sorted_ranks[index + tied_count] == rank:
+            tied_count += 1
+        expected_rank += tied_count
+        index += tied_count
+    return True
+
+
 def validate_result_frame(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     normalized = _coerce_optional_result_columns(result_df)
+    normalized["_input_order"] = range(len(normalized))
     if "race_id" not in normalized.columns:
         race_ids = entry_df["race_id"].dropna().astype("string").unique().tolist()
         if len(race_ids) != 1:
@@ -386,8 +418,6 @@ def validate_result_frame(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> tu
         raise SystemExit("[ERROR] result.csv の finish_rank は 1 以上である必要があります。")
     if normalized["horse_id"].duplicated().any():
         raise SystemExit("[ERROR] result.csv の horse_id が重複しています。")
-    if normalized["finish_rank"].duplicated().any():
-        raise SystemExit("[ERROR] result.csv の finish_rank が重複しています。")
 
     entry_keys = entry_df[["race_id", "horse_id"]].copy()
     entry_keys["race_id"] = entry_keys["race_id"].astype("string")
@@ -398,11 +428,12 @@ def validate_result_frame(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> tu
         raise SystemExit(f"[ERROR] result.csv に entry.csv に存在しない馬が含まれています: {unknown.to_dict(orient='records')}")
 
     ranks = sorted(normalized["finish_rank"].tolist())
-    expected_partial = list(range(1, len(normalized) + 1))
-    is_full_result = len(normalized) == len(entry_df) and ranks == list(range(1, len(entry_df) + 1))
-    if not is_full_result and ranks != expected_partial:
-        raise SystemExit("[ERROR] partial result.csv は 1着から連番の TopK 形式である必要があります。")
-    return normalized.sort_values("finish_rank").reset_index(drop=True), is_full_result
+    is_valid_ranking = _is_valid_competition_ranking(ranks)
+    is_full_result = len(normalized) == len(entry_df) and is_valid_ranking
+    if not is_valid_ranking:
+        raise SystemExit("[ERROR] result.csv は 1着からの公式順位形式である必要があります（同着による順位飛びは可）。")
+    normalized = normalized.sort_values(["finish_rank", "_input_order"], kind="mergesort").drop(columns=["_input_order"])
+    return normalized.reset_index(drop=True), is_full_result
 
 
 def build_settled_entry(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFrame:
@@ -447,6 +478,22 @@ def _sort_predictions(predictions_df: pd.DataFrame) -> pd.DataFrame:
     return ranked.sort_values(["consensus_top3_score", "top3_ci_width"], ascending=[False, True]).reset_index(drop=True)
 
 
+def _select_report_axis_row(ranked_predictions_df: pd.DataFrame) -> pd.Series:
+    if "axis_score" not in ranked_predictions_df.columns:
+        return ranked_predictions_df.iloc[0]
+
+    axis_score = pd.to_numeric(ranked_predictions_df["axis_score"], errors="coerce")
+    if axis_score.notna().any():
+        ranked = ranked_predictions_df.assign(_axis_score_numeric=axis_score)
+        selected = ranked.sort_values(
+            ["_axis_score_numeric", "consensus_top3_score"],
+            ascending=[False, False],
+        ).iloc[0]
+        return selected.drop(labels=["_axis_score_numeric"])
+
+    return ranked_predictions_df.iloc[0]
+
+
 def build_post_race_analysis(
     predictions_df: pd.DataFrame | None,
     result_df: pd.DataFrame,
@@ -486,6 +533,7 @@ def build_post_race_report(
     appended_to_training_history: bool,
     race_meta: Dict[str, object] | None = None,
     analysis_df: pd.DataFrame | None = None,
+    output_dir: Path | None = None,
 ) -> Dict[str, object]:
     result_norm = result_df.copy()
     result_norm["horse_id"] = result_norm["horse_id"].astype("string")
@@ -511,7 +559,7 @@ def build_post_race_report(
     predicted_top3 = ranked.head(3)
     predicted_top3_ids = set(predicted_top3["horse_id"].astype("string"))
     actual_top3_ids = set(result_norm[result_norm["finish_rank"] <= 3]["horse_id"].astype("string"))
-    axis_row = ranked.iloc[0]
+    axis_row = _select_report_axis_row(ranked)
     winner_row = result_norm.sort_values("finish_rank").iloc[0]
     if "selected_top3_model" in ranked.columns and ranked["selected_top3_model"].notna().any():
         report["selected_top3_model"] = str(ranked["selected_top3_model"].dropna().iloc[0])
@@ -524,6 +572,8 @@ def build_post_race_report(
         "horse_display_name": str(axis_row["horse_display_name"]),
         "consensus_top3_score": float(axis_row["consensus_top3_score"]),
     }
+    if "axis_score" in axis_row.index and pd.notna(axis_row["axis_score"]):
+        report["predicted_axis_horse"]["axis_score"] = float(axis_row["axis_score"])
     actual_winner: Dict[str, object] = {}
     for key in [col for col in ["horse_id", "horse_name", "finish_rank", "result_time", "result_time_seconds"] if col in winner_row.index]:
         value = winner_row[key]
@@ -582,7 +632,72 @@ def build_post_race_report(
                 ["abs_rank_error", "abs_mean_rank_error"],
                 ascending=[False, False],
             )[miss_columns].head(5).to_dict(orient="records")
+
+    if "axis_score" in ranked.columns:
+        axis_score_val = float(axis_row.get("axis_score") or float("nan"))
+        axis_score_series = pd.to_numeric(ranked["axis_score"], errors="coerce")
+        axis_rank_in_field = int((axis_score_series > axis_score_val).sum()) + 1
+        axis_tail_risk_val = float(axis_row.get("axis_tail_risk") or float("nan"))
+        report["axis_evaluation"] = {
+            "axis_score": axis_score_val,
+            "axis_rank_in_field": axis_rank_in_field,
+            "axis_tail_risk": axis_tail_risk_val,
+            "hit_top3": bool(str(axis_row["horse_id"]) in actual_top3_ids),
+            "finish_rank": report.get("axis_finish_rank"),
+            "selection_reason": _compute_selection_reason(axis_row),
+        }
+
+    if output_dir is not None:
+        partners_path = Path(output_dir) / "recommended_partners.json"
+        if partners_path.exists():
+            try:
+                import json as _json
+                partners_payload = _json.loads(partners_path.read_text(encoding="utf-8"))
+                partner_ids = {str(p["horse_id"]) for p in partners_payload.get("partners", [])}
+                n_partners = len(partner_ids)
+                covered = len(partner_ids & actual_top3_ids)
+                all_ids = partner_ids | {str(axis_row["horse_id"])}
+                axis_plus_covered = len(all_ids & actual_top3_ids)
+                field_size = len(result_norm)
+                max_possible = min(3, field_size)
+                missed = [
+                    {"horse_id": hid}
+                    for hid in actual_top3_ids
+                    if hid not in partner_ids
+                ]
+                report["partner_evaluation"] = {
+                    "n_partners": n_partners,
+                    "actual_top3_covered": covered,
+                    "cover_rate": float(covered / max_possible) if max_possible > 0 else 0.0,
+                    "missed_horses": missed,
+                    "axis_plus_partners_top3_covered": axis_plus_covered,
+                }
+            except Exception:
+                pass
+
+    report["failure_pattern"] = classify_failure_pattern(report)
+
     return report
+
+
+def classify_failure_pattern(report: Dict[str, object]) -> str:
+    axis_hit = bool(
+        report.get("axis_hit_top3")
+        if report.get("axis_hit_top3") is not None
+        else dict(report.get("axis_evaluation", {}) or {}).get("hit_top3", False)
+    )
+    partner_eval = dict(report.get("partner_evaluation", {}) or {})
+    cover_rate = float(partner_eval.get("cover_rate", 0.0) or 0.0)
+
+    if (not axis_hit) and cover_rate < 0.5:
+        return "both_miss"
+    if not axis_hit:
+        return "axis_miss"
+    if cover_rate < 0.5:
+        return "partner_miss"
+    if cover_rate >= 0.67:
+        return "hit"
+    return "partial_hit"
 
 
 def settle_race(
@@ -627,6 +742,7 @@ def settle_race(
         appended_to_training_history=appended_to_training_history,
         race_meta=result_meta,
         analysis_df=analysis_df,
+        output_dir=output_dir,
     )
     save_json(output_dir / "post_race_report.json", report)
 
