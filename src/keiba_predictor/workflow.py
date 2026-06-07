@@ -369,8 +369,32 @@ def predict_race(
     return result
 
 
+def _is_valid_competition_ranking(ranks: list[int]) -> bool:
+    """Validate official competition ranking, including dead heats.
+
+    Examples: [1, 2, 3], [1, 2, 2, 4], and [1, 1, 3] are valid.
+    """
+    if not ranks:
+        return False
+
+    expected_rank = 1
+    index = 0
+    sorted_ranks = sorted(ranks)
+    while index < len(sorted_ranks):
+        rank = sorted_ranks[index]
+        if rank != expected_rank:
+            return False
+        tied_count = 0
+        while index + tied_count < len(sorted_ranks) and sorted_ranks[index + tied_count] == rank:
+            tied_count += 1
+        expected_rank += tied_count
+        index += tied_count
+    return True
+
+
 def validate_result_frame(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
     normalized = _coerce_optional_result_columns(result_df)
+    normalized["_input_order"] = range(len(normalized))
     if "race_id" not in normalized.columns:
         race_ids = entry_df["race_id"].dropna().astype("string").unique().tolist()
         if len(race_ids) != 1:
@@ -394,8 +418,6 @@ def validate_result_frame(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> tu
         raise SystemExit("[ERROR] result.csv の finish_rank は 1 以上である必要があります。")
     if normalized["horse_id"].duplicated().any():
         raise SystemExit("[ERROR] result.csv の horse_id が重複しています。")
-    if normalized["finish_rank"].duplicated().any():
-        raise SystemExit("[ERROR] result.csv の finish_rank が重複しています。")
 
     entry_keys = entry_df[["race_id", "horse_id"]].copy()
     entry_keys["race_id"] = entry_keys["race_id"].astype("string")
@@ -406,11 +428,12 @@ def validate_result_frame(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> tu
         raise SystemExit(f"[ERROR] result.csv に entry.csv に存在しない馬が含まれています: {unknown.to_dict(orient='records')}")
 
     ranks = sorted(normalized["finish_rank"].tolist())
-    expected_partial = list(range(1, len(normalized) + 1))
-    is_full_result = len(normalized) == len(entry_df) and ranks == list(range(1, len(entry_df) + 1))
-    if not is_full_result and ranks != expected_partial:
-        raise SystemExit("[ERROR] partial result.csv は 1着から連番の TopK 形式である必要があります。")
-    return normalized.sort_values("finish_rank").reset_index(drop=True), is_full_result
+    is_valid_ranking = _is_valid_competition_ranking(ranks)
+    is_full_result = len(normalized) == len(entry_df) and is_valid_ranking
+    if not is_valid_ranking:
+        raise SystemExit("[ERROR] result.csv は 1着からの公式順位形式である必要があります（同着による順位飛びは可）。")
+    normalized = normalized.sort_values(["finish_rank", "_input_order"], kind="mergesort").drop(columns=["_input_order"])
+    return normalized.reset_index(drop=True), is_full_result
 
 
 def build_settled_entry(entry_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFrame:

@@ -177,6 +177,26 @@ class TestValidateResultFrame:
         assert normalized["result_final_popularity"].tolist() == [1, 15, 7]
         assert normalized["result_body_weight_diff"].tolist() == [-2, -18, 3]
 
+    def test_accepts_dead_heat_competition_ranking(self):
+        entry_df = _sample_entry_df()
+        result_df = _sample_result_df()
+        result_df.loc[result_df["horse_id"].isin(["H002", "H003"]), "finish_rank"] = 2
+        result_df.loc[result_df["horse_id"] == "H003", "result_margin"] = "同着"
+
+        normalized, is_full_result = validate_result_frame(entry_df, result_df)
+
+        assert is_full_result is True
+        assert normalized["horse_id"].tolist() == ["H001", "H002", "H003"]
+        assert normalized["finish_rank"].tolist() == [1, 2, 2]
+
+    def test_rejects_skipped_rank_without_dead_heat(self):
+        entry_df = _sample_entry_df()
+        result_df = _sample_result_df()
+        result_df.loc[result_df["horse_id"] == "H003", "finish_rank"] = 4
+
+        with pytest.raises(SystemExit, match="公式順位形式"):
+            validate_result_frame(entry_df, result_df)
+
 
 class TestBuildSettledEntry:
     def test_preserves_optional_result_columns(self):
